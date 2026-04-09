@@ -795,7 +795,6 @@ def _build_alloc_rows(capital):
         flow_snap = {}
 
     from money_flow import get_ticker_sector as _get_sec
-    from lot_size import get_lot as _get_lot, round_to_lot as _round_lot
     rows = []
     colors = ["#2563eb","#16a34a","#f59e0b","#8b5cf6","#dc2626",
               "#0891b2","#ec4899","#14b8a6","#f97316","#84cc16"]
@@ -884,7 +883,6 @@ def _build_alloc_rows(capital):
                     "flow_score":  flow_sc,
                     "sell_rot":    sell_rot,
                     "buy_rot":     buy_rot,
-                    "lot":         _get_lot(ticker, float(df_h["Close"].iloc[-1]) if df_h is not None and len(df_h)>0 else 0),
                 })
     except Exception: pass
 
@@ -964,9 +962,63 @@ def _build_alloc_rows(capital):
                     "flow_score":  flow_sc,
                     "sell_rot":    sell_rot,
                     "buy_rot":     buy_rot,
-                    "lot":         1,  # forex/commodity — no board lot
                 })
     except Exception: pass
+
+    # Add study universe instruments (opportunities not yet in portfolio)
+    try:
+        from portfolio_study import get_study_universe
+        study_df = get_study_universe()
+        if not study_df.empty:
+            existing = {r["ticker"] for r in rows}
+            colors2 = ["#94a3b8","#64748b","#475569","#334155","#1e293b"]
+            study_added = 0
+            # Top 15 by study_score — skip slow fetches for full 100+ universe
+            top_study = study_df[~study_df["ticker"].isin(existing)]
+            top_study = top_study.nlargest(15, "study_score")
+            for i,(_,sr) in enumerate(top_study.iterrows()):
+                if float(sr.get("study_score",0) or 0) < 35: continue
+                try:
+                    df_s = fetch_day(sr["ticker"],"6mo")
+                    if df_s is not None and len(df_s)>=15:
+                        rets_s = df_s["Close"].pct_change().dropna()
+                        vol_s  = float(rets_s.std()*np.sqrt(252)*100)
+                        ret_s  = float((df_s["Close"].iloc[-1]-df_s["Close"].iloc[0])/
+                                       df_s["Close"].iloc[0]*100)
+                        sharpe_s = ret_s/vol_s if vol_s>0 else 0
+                    else:
+                        sharpe_s = float(sr.get("sharpe",0) or 0)
+                    sec_name = _get_sec(sr["ticker"]) or ""
+                    flow_sc  = flow_snap.get(sec_name, 0)
+                    sell_rot_s = buy_rot_s = 50
+                    rows.append({
+                        "ticker":     sr["ticker"],
+                        "name":       sr.get("name", sr["ticker"]),
+                        "type":       sr.get("type","Stock"),
+                        "status":     "WATCH",
+                        "qty":        0,
+                        "avg_cost":   0,
+                        "cost":       0,
+                        "alloc":      0.0,
+                        "sharpe":     round(sharpe_s,3),
+                        "chop":       float(sr.get("chop",50) or 50),
+                        "chop_now":   float(sr.get("chop",50) or 50),
+                        "avg_range":  float(sr.get("avg_range",0) or 0),
+                        "avg_range_pct": float(sr.get("avg_range",0) or 0),
+                        "win_rate":   float(sr.get("win_rate",50) or 50),
+                        "trend_score":int(sr.get("trend_score",0) or 0),
+                        "color":      colors2[study_added % len(colors2)],
+                        "sector":     sec_name,
+                        "flow_score": flow_sc,
+                        "sell_rot":   sell_rot_s,
+                        "buy_rot":    buy_rot_s,
+                    })
+                    study_added += 1
+                    _time.sleep(0.1)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     return rows
 
@@ -1028,17 +1080,25 @@ Instruments where you have a statistical edge get more capital.
 
     sharpe_raw   = _max_sharpe_weights(rows, max_single, min_pos)
     kelly_raw    = _kelly_weights(rows, max_single, min_pos)
-    sharpe_final = _apply_constraints(sharpe_raw,  max_single, min_pos)
-    kelly_final  = _apply_constraints(kelly_raw,   max_single, min_pos)
+    range_raw    = _range_opportunity_weights(rows, max_single, min_pos)
+    momentum_raw = _momentum_efficiency_weights(rows, max_single, min_pos)
+    cycle_raw    = _cycle_adjusted_weights(rows, max_single, min_pos)
+
+    sharpe_final   = _apply_constraints(sharpe_raw,   max_single, min_pos)
+    kelly_final    = _apply_constraints(kelly_raw,    max_single, min_pos)
+    range_final    = _apply_constraints(range_raw,    max_single, min_pos)
+    momentum_final = _apply_constraints(momentum_raw, max_single, min_pos)
+    cycle_final    = _apply_constraints(cycle_raw,    max_single, min_pos)
 
     by_ticker = {r["ticker"]: r for r in rows}
 
     # Summary
-    m1,m2,m3,m4 = st.columns(4)
+    m1,m2,m3,m4,m5 = st.columns(5)
     m1.metric("Items analysed",     len(rows))
     m2.metric("Capital to deploy",  f"HKD {deployable:,.0f}")
-    m3.metric("Active (Sharpe)",    str(sum(1 for v in sharpe_final.values() if v>0)))
-    m4.metric("Active (Kelly)",     str(sum(1 for v in kelly_final.values()  if v>0)))
+    m3.metric("Sharpe active",      str(sum(1 for v in sharpe_final.values() if v>0)))
+    m4.metric("Kelly active",       str(sum(1 for v in kelly_final.values()  if v>0)))
+    m5.metric("Range active",       str(sum(1 for v in range_final.values()  if v>0)))
 
     st.markdown("<br>",unsafe_allow_html=True)
     st.markdown("**Allocation comparison table**")
@@ -1047,26 +1107,39 @@ Instruments where you have a statistical edge get more capital.
     for t,s in by_ticker.items():
         sh_p = sharpe_final.get(t,0)
         ke_p = kelly_final.get(t,0)
+        ra_p = range_final.get(t,0)
+        mo_p = momentum_final.get(t,0)
+        cy_p = cycle_final.get(t,0)
         cur  = s.get("alloc",0)
-        consensus = round((sh_p+ke_p)/2,1) if sh_p>0 and ke_p>0 else round(max(sh_p,ke_p)*0.7,1)
-        hkd_c = round(consensus/100*deployable,0)
-        diff  = consensus-cur
+
+        # Consensus: average of all methods with votes
+        active = [v for v in [sh_p,ke_p,ra_p,mo_p,cy_p] if v>0]
+        if len(active) >= 3:
+            consensus = round(sum(active)/len(active), 1)
+        elif len(active) >= 1:
+            consensus = round(sum(active)/len(active)*0.7, 1)  # discount minority agreement
+        else:
+            consensus = 0
+
+        hkd_c = round(consensus/100*deployable, 0)
+        diff  = consensus - cur
         status_lbl = s.get("status","OPEN")
+        votes  = sum(1 for v in [sh_p,ke_p,ra_p,mo_p,cy_p] if v>0)
 
         if consensus==0:
             ts=s.get("trend_score",0)
-            if ts>=70:   reason="Trend trap"
+            if ts>=70:              reason="Trend trap — all methods reject"
             elif s.get("sharpe",0)<=0: reason="Negative Sharpe"
-            else:        reason="Below min size"
+            else:                   reason="No method agrees"
             action="CLOSE/AVOID"; ac_="#dc2626"
         elif diff>10:
-            reason=f"Underweight vs optimal"
+            reason=f"{votes}/5 methods agree — underweight"
             action=f"↑ +{diff:.0f}%"; ac_="#16a34a"
         elif diff<-10:
-            reason=f"Overweight vs optimal"
+            reason=f"{votes}/5 methods agree — overweight"
             action=f"↓ {diff:.0f}%"; ac_="#f59e0b"
         else:
-            reason="Near optimal"
+            reason=f"{votes}/5 methods agree — near optimal"
             action="✓ HOLD"; ac_="#64748b"
 
         fl   = s.get("flow_score", 0)
@@ -1080,34 +1153,23 @@ Instruments where you have a statistical edge get more capital.
             "Name":       s["name"],
             "Ticker":     t,
             "Type":       s.get("type","—"),
-            "Rotation":   f"{rot_label} (B:{br:.0f}/S:{sr:.0f})",
-            "Sector Flow":f"{fl_s} {fl:+d}",
+            "Rotation":   f"{rot_label}",
+            "Flow":       f"{fl_s} {fl:+d}",
             "Current %":  f"{cur:.1f}%",
             "Sharpe":     f"{sh_p:.1f}%" if sh_p>0 else "—",
             "Kelly":      f"{ke_p:.1f}%" if ke_p>0 else "—",
+            "Range opp":  f"{ra_p:.1f}%" if ra_p>0 else "—",
+            "Momentum":   f"{mo_p:.1f}%" if mo_p>0 else "—",
+            "Cycle adj":  f"{cy_p:.1f}%" if cy_p>0 else "—",
+            "Votes":      f"{votes}/5",
             "Consensus %":f"{consensus:.1f}%" if consensus>0 else "—",
             "HKD":        f"HKD {hkd_c:,.0f}" if consensus>0 else "—",
             "Action":     action,
             "Reason":     reason,
             "_consensus": consensus,
             "_ac":        ac_,
-            "_lot":       s.get("lot", 100),
-            "_price":     float(s.get("avg_cost",0) or 0),
         })
 
-    # Add lot info
-    for r in tbl:
-        lot_ = r.get("_lot",100)
-        p_   = r.get("_price",0)
-        r["Min 1 lot"] = f"{lot_:,} sh · HKD {lot_*p_:,.0f}" if lot_>1 and p_>0 else "—"
-        # Round HKD to lot
-        if r["_consensus"]>0 and lot_>1 and p_>0:
-            deployable_  = capital*(1-cash_reserve/100)
-            alloc_hkd    = r["_consensus"]/100*deployable_
-            lots_n       = max(int(alloc_hkd/(lot_*p_)),1) if p_>0 else 1
-            actual_shares= lots_n*lot_
-            actual_hkd   = actual_shares*p_
-            r["HKD"] = f"HKD {actual_hkd:,.0f} ({lots_n} lots × {lot_:,})"
     tbl.sort(key=lambda x: -x["_consensus"])
     df_clean = pd.DataFrame([{k:v for k,v in r.items() if not k.startswith("_")} for r in tbl])
 
@@ -1135,31 +1197,50 @@ Instruments where you have a statistical edge get more capital.
     st.dataframe(df_clean.style.apply(style_tbl,axis=None),
                  use_container_width=True, hide_index=True)
 
+    # Method explanation expander
+    with st.expander("📖 What each method measures"):
+        st.markdown("""
+**Max Sharpe** (historical) — 6-month return ÷ volatility. Best for: identifying positions that earned well relative to their risk historically. Weakness: backward-looking.
+
+**Kelly** (edge-based) — win rate edge ÷ odds. Best for: positions where your historical win rate justifies bigger bets. Weakness: uses history, not today's conditions.
+
+**Range Opportunity** (daily trader) — avg daily price range ÷ price. Best for: finding which position offers the most HKD swing per HKD invested TODAY. Directly relevant to range trading.
+
+**Momentum Efficiency** (right now) — recent buy/sell signal strength ÷ volatility. Best for: deploying capital into what is moving cleanly in your favour right now. Most forward-looking.
+
+**Cycle-Adjusted** (timing) — buy signal at early cycle = full weight, sell signal at peak = minimal weight. Best for: matching capital deployment to where you are in the swing. Most relevant to daily cycling.
+
+**Votes (N/5)** — how many methods agree this position deserves capital. 4-5/5 = strong conviction. 1-2/5 = only one method sees it. **Consensus** discounts minority agreement.
+        """)
+
     # Pies
-    pc1,pc2,pc3=st.columns(3)
-    def _pie(weights,title):
+    def _pie(weights, title):
         active={t:v for t,v in weights.items() if v>0}
-        if not active: return
+        if not active: return None
         lbl=[by_ticker[t]["name"] for t in active]+["Cash"]
         val=list(active.values())+[cash_reserve]
         col=[by_ticker[t].get("color","#94a3b8") for t in active]+["#e2e8f0"]
         fig=go.Figure(go.Pie(labels=lbl,values=val,marker=dict(colors=col),
             hole=0.45,textinfo="label+percent",
             hovertemplate="%{label}: %{value:.1f}%<extra></extra>"))
-        fig.update_layout(height=240,margin=dict(l=0,r=0,t=24,b=0),
+        fig.update_layout(height=220,margin=dict(l=0,r=0,t=24,b=0),
             title=dict(text=title,font=dict(size=11)),
             showlegend=False,paper_bgcolor="rgba(0,0,0,0)")
         return fig
-    with pc1:
-        f=_pie(sharpe_final,"Max Sharpe")
-        if f: st.plotly_chart(f,use_container_width=True)
-    with pc2:
-        f=_pie(kelly_final,"Kelly")
-        if f: st.plotly_chart(f,use_container_width=True)
-    with pc3:
-        cons_w={r["Ticker"]:r["_consensus"] for r in tbl if r["_consensus"]>0}
-        f=_pie(cons_w,"Consensus")
-        if f: st.plotly_chart(f,use_container_width=True)
+
+    st.markdown("**All five methods + consensus**")
+    pie_cols = st.columns(3)
+    for col_, (weights_, title_) in zip(
+        pie_cols*2,
+        [(sharpe_final,"Sharpe"),(kelly_final,"Kelly"),(range_final,"Range Opp"),
+         (momentum_final,"Momentum"),(cycle_final,"Cycle Adj")]):
+        f = _pie(weights_, title_)
+        if f: col_.plotly_chart(f, use_container_width=True)
+
+    # Consensus pie separately
+    cons_w={r["Ticker"]:r["_consensus"] for r in tbl if r["_consensus"]>0}
+    f_cons = _pie(cons_w,"★ Consensus (5-method)")
+    if f_cons: st.plotly_chart(f_cons, use_container_width=True)
 
     # Alerts
     avoid=[r for r in tbl if r["_consensus"]==0 and float(str(r["Current %"]).replace("%",""))>0]
@@ -1172,8 +1253,9 @@ Instruments where you have a statistical edge get more capital.
                 f"{', '.join(r['Name'] for r in watch_alloc[:3])} — "
                 f"optimizer suggests allocating capital here if you enter.")
 
-    st.caption("Max Sharpe: return/volatility ratio. Kelly: win-rate edge model. "
-               "Both penalise trend traps and low choppiness. Not financial advice.")
+    st.caption("5 methods: Sharpe (historical) · Kelly (win-rate) · Range Opp (daily swing) · "
+               "Momentum (right now) · Cycle-Adj (timing). All penalise trend traps + outflow. "
+               "Not financial advice.")
 
 def _max_sharpe_weights(study_rows, max_single, min_pos):
     """
@@ -1260,6 +1342,107 @@ def _kelly_weights(study_rows, max_single, min_pos):
         else:              rot_m = 1.00
 
         weights[s["ticker"]] = kelly * cm * tm * rm * fm * rot_m
+
+    total = sum(weights.values())
+    if total == 0:
+        return {s["ticker"]: 0 for s in study_rows}
+    return {t: w/total*100 for t,w in weights.items()}
+
+
+
+def _range_opportunity_weights(study_rows, max_single, min_pos):
+    """
+    Range Opportunity: weight by avg_daily_range / price.
+    For a range trader — most HKD swing per HKD of capital deployed.
+    High avg_range% = more opportunity per dollar invested.
+    Penalise trend traps (no upper swing available).
+    """
+    weights = {}
+    for s in study_rows:
+        avg_r_pct = s.get("avg_range_pct", 0) or 0   # avg daily range as % of price
+        if avg_r_pct <= 0:
+            weights[s["ticker"]] = 0; continue
+
+        ts  = s.get("trend_score", 0)
+        tm  = max(0.1, (100 - ts) / 100)             # trend trap penalty
+        chop = s.get("chop_now",50) or s.get("chop",50) or 50
+        cm  = 1.3 if chop>=61.8 else 1.0 if chop>=50 else 0.6 if chop>=38 else 0.2
+
+        flow = s.get("flow_score", 0)
+        fm   = 1.30 if flow>=50 else 1.15 if flow>=20 else 1.0 if flow>=-20 else 0.75 if flow>=-50 else 0.50
+
+        buy_r = s.get("buy_rot", 50); sell_r = s.get("sell_rot", 50)
+        rot_m = 1.20 if buy_r>=70 else 1.10 if buy_r>=62 else 0.60 if sell_r>=70 else 0.80 if sell_r>=62 else 1.00
+
+        weights[s["ticker"]] = avg_r_pct * tm * cm * fm * rot_m
+
+    total = sum(weights.values())
+    if total == 0:
+        return {s["ticker"]: 0 for s in study_rows}
+    return {t: w/total*100 for t,w in weights.items()}
+
+
+def _momentum_efficiency_weights(study_rows, max_single, min_pos):
+    """
+    Momentum Efficiency: recent return / volatility — is it moving cleanly NOW?
+    Uses 5d/20d return vs ann_vol. Different from Sharpe which uses 6-month history.
+    Good for daily cycling — allocate to what's moving cleanly today.
+    """
+    weights = {}
+    for s in study_rows:
+        ann_vol = s.get("ann_vol", 30) or 30
+        # Use sell_rot/buy_rot as proxy for recent momentum direction
+        buy_r   = s.get("buy_rot", 50)
+        sell_r  = s.get("sell_rot", 50)
+        # Momentum score: positive if buy signals strong, negative if sell
+        mom_score = (buy_r - sell_r) / 100     # -1 to +1
+        if mom_score <= 0:
+            weights[s["ticker"]] = 0; continue
+
+        # Efficiency: momentum per unit of volatility
+        efficiency = mom_score / (ann_vol / 100)
+
+        ts   = s.get("trend_score", 0)
+        tm   = max(0.1, (100 - ts) / 100)
+        flow = s.get("flow_score", 0)
+        fm   = 1.30 if flow>=50 else 1.15 if flow>=20 else 1.0 if flow>=-20 else 0.75 if flow>=-50 else 0.50
+
+        weights[s["ticker"]] = max(efficiency, 0) * tm * fm
+
+    total = sum(weights.values())
+    if total == 0:
+        return {s["ticker"]: 0 for s in study_rows}
+    return {t: w/total*100 for t,w in weights.items()}
+
+
+def _cycle_adjusted_weights(study_rows, max_single, min_pos):
+    """
+    Cycle-Adjusted: more capital early in cycle, less at peak.
+    Early cycle (buy_rot high) = full weight.
+    Late/peak cycle (sell_rot high) = heavily reduced.
+    Best for daily cycling — reflects today's opportunity, not history.
+    """
+    weights = {}
+    for s in study_rows:
+        buy_r  = s.get("buy_rot", 50)
+        sell_r = s.get("sell_rot", 50)
+        chop   = s.get("chop_now",50) or s.get("chop",50) or 50
+        ts     = s.get("trend_score", 0)
+
+        # Base weight purely from cycle position
+        if sell_r >= 75:    base = 0.1   # peak — almost no capital
+        elif sell_r >= 62:  base = 0.4
+        elif buy_r >= 75:   base = 1.0   # early — full capital
+        elif buy_r >= 62:   base = 0.8
+        else:               base = 0.6   # mid cycle — moderate
+
+        # Require choppiness — if not oscillating, no point
+        cm = 1.2 if chop>=61.8 else 1.0 if chop>=50 else 0.5 if chop>=38 else 0.1
+        tm = max(0.1, (100 - ts) / 100)
+        flow = s.get("flow_score", 0)
+        fm   = 1.30 if flow>=50 else 1.15 if flow>=20 else 1.0 if flow>=-20 else 0.75 if flow>=-50 else 0.50
+
+        weights[s["ticker"]] = base * cm * tm * fm
 
     total = sum(weights.values())
     if total == 0:

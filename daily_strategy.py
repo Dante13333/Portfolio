@@ -27,14 +27,80 @@ import time, pytz
 from db_manager import (
     get_portfolio_full, get_latest_capital,
     init_portfolio_extended, init_activity_log, log_activity,
-    upsert_position_full,
+    upsert_position_full, get_conn,
 )
+
+# ── DAILY FORECAST DB ────────────────────────────────────────────────
+def _init_forecast_db():
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_forecast (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            date         TEXT NOT NULL,
+            ticker       TEXT NOT NULL,
+            name         TEXT,
+            action       TEXT,
+            est_pnl      REAL,
+            est_pnl_pct  REAL,
+            est_note     TEXT,
+            open_price   REAL,
+            close_price  REAL,
+            actual_pnl   REAL,
+            actual_pct   REAL,
+            correct      INTEGER,
+            logged_at    TEXT DEFAULT (datetime('now')),
+            UNIQUE(date, ticker)
+        )
+    """)
+    conn.commit(); conn.close()
+
+def save_forecast(date, ticker, name, action, est_pnl, est_pnl_pct, est_note, open_price):
+    _init_forecast_db()
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO daily_forecast
+        (date,ticker,name,action,est_pnl,est_pnl_pct,est_note,open_price)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(date,ticker) DO UPDATE SET
+            action=excluded.action, est_pnl=excluded.est_pnl,
+            est_pnl_pct=excluded.est_pnl_pct, est_note=excluded.est_note,
+            open_price=excluded.open_price, logged_at=datetime('now')
+    """, (date,ticker,name,action,est_pnl,est_pnl_pct,est_note,open_price))
+    conn.commit(); conn.close()
+
+def update_actual(date, ticker, close_price, qty, avg_cost):
+    _init_forecast_db()
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT est_pnl, open_price, action FROM daily_forecast WHERE date=? AND ticker=?",
+        (date, ticker)).fetchone()
+    if not row:
+        conn.close(); return
+    open_p = row[1] or avg_cost
+    actual_pnl = (close_price - open_p) * qty if qty > 0 else 0
+    actual_pct = (close_price - open_p) / open_p * 100 if open_p > 0 else 0
+    est_pnl    = row[0] or 0
+    # Correct if actual_pnl and est_pnl have same sign, or action was EXIT and pnl > 0
+    correct = 1 if (est_pnl * actual_pnl > 0) or                    ("EXIT" in str(row[2]) and actual_pnl >= 0) else 0
+    conn.execute("""
+        UPDATE daily_forecast SET close_price=?,actual_pnl=?,actual_pct=?,correct=?
+        WHERE date=? AND ticker=?
+    """, (close_price, round(actual_pnl,2), round(actual_pct,2), correct, date, ticker))
+    conn.commit(); conn.close()
+
+def get_forecast_history(days=30):
+    _init_forecast_db()
+    conn = get_conn()
+    import pandas as pd
+    df = pd.read_sql_query("""
+        SELECT * FROM daily_forecast
+        WHERE date >= date('now',?)
+        ORDER BY date DESC, ticker
+    """, conn, params=(f'-{days} days',))
+    conn.close()
+    return df
+
 from portfolio_manager import get_monitor_pos
-try:
-    from lot_size import get_lot as _lot_sz, round_to_lot as _rnd_lot
-except Exception:
-    _lot_sz = lambda t,p=None: 100
-    _rnd_lot = lambda s,l: int(s//l)*l
 try:
     from money_flow import get_ticker_flow as _get_flow
 except Exception:
@@ -627,12 +693,37 @@ LOW: mixed signals — best to wait.
                 "src":      "monitor",
             })
 
+    # Add study universe instruments not already in portfolio (as opportunities)
+    try:
+        from portfolio_study import get_study_universe
+        study_df = get_study_universe()
+        if not study_df.empty:
+            existing_tickers = {p["ticker"] for p in all_pos}
+            # Top 10 by study_score only — avoid slow fetches for 100+ instruments
+            top_study = study_df[~study_df["ticker"].isin(existing_tickers)]
+            top_study = top_study.nlargest(10, "study_score")
+            for _, sr in top_study.iterrows():
+                if sr.get("study_score",0) > 40:
+                    all_pos.append({
+                        "ticker":   sr["ticker"],
+                        "name":     sr.get("name", sr["ticker"]),
+                        "avg_cost": 0.0,
+                        "qty":      0,           # not held — opportunity
+                        "target":   None,
+                        "stop":     None,
+                        "status":   "WATCH",
+                        "src":      "study",
+                    })
+    except Exception:
+        pass
+
     if not all_pos:
         st.info("No positions in portfolio yet. Add stocks, forex or commodities in 📋 Portfolio.")
         return
 
     total_invested=sum(p["qty"]*p["avg_cost"] for p in all_pos if p["qty"]>0)
 
+    _init_forecast_db()
     col_refresh,col_note=st.columns([1,3])
     if col_refresh.button("🔄 Refresh all",key="ds_refresh"):
         st.cache_data.clear(); st.rerun()
@@ -653,6 +744,18 @@ LOW: mixed signals — best to wait.
             r["src"]=p["src"]
             results.append(r)
             time.sleep(0.15)
+
+    # Auto-save today's forecasts to DB
+    today_str = now_hk.strftime("%Y-%m-%d")
+    for r in results:
+        if r.get("error") or not r.get("price"): continue
+        try:
+            save_forecast(
+                today_str, r["ticker"], r["name"],
+                r.get("action","—"),
+                r.get("est_pnl",0), r.get("est_pnl_pct",0),
+                r.get("est_note",""), r.get("price",0))
+        except Exception: pass
 
     # ── Quick summary strip ───────────────────────────────────────────
     exits   =[r for r in results if "EXIT" in r.get("action","")]
@@ -897,8 +1000,6 @@ LOW: mixed signals — best to wait.
                     reasons.append("near target — take profit")
                 reason_str = " · ".join(reasons) if reasons else "rotation timing"
 
-                _sell_lot = _lot_sz(r["ticker"], r["price"])
-                _sell_lots = int(r["qty"]//_sell_lot) if _sell_lot>0 else 0
                 st.markdown(
                     f"<div style='border:1px solid #fca5a5;border-radius:10px;"
                     f"padding:12px 16px;margin-bottom:6px;background:rgba(220,38,38,0.03);"
@@ -913,8 +1014,7 @@ LOW: mixed signals — best to wait.
                     f"<div style='font-size:0.75rem;color:{pnl_c}'>"
                     f"P&L: {'+'if r['pnl']>=0 else ''}{r['pnl']:,.0f}</div>"
                     f"<div style='font-size:0.72rem;color:#dc2626'>"
-                    f"Frees: HKD {r['freed']:,.0f} "
-                    f"({_sell_lots} lots × {_sell_lot:,})</div>"
+                    f"Frees: HKD {r['freed']:,.0f}</div>"
                     f"<div style='font-size:0.68rem;color:#94a3b8'>"
                     f"Sell score: {r['sell_score']:.0f}/100</div>"
                     f"</div></div>",
@@ -939,10 +1039,7 @@ LOW: mixed signals — best to wait.
                 alloc_pct  = r["buy_score"]/total_buy_score*100 if total_buy_score>0 else 0
                 alloc_hkd  = deployable * alloc_pct/100
                 price_s = f"{r['price']:,.2f}" if r["price"]>10 else f"{r['price']:,.4f}"
-                _lot    = _lot_sz(r["ticker"], r["price"])
-                shares_raw = alloc_hkd/r["price"] if r["price"]>0 else 0
-                shares_sug = _rnd_lot(shares_raw, _lot)
-                lots_sug   = shares_sug//_lot if _lot>0 else 0
+                shares_sug = int(alloc_hkd/r["price"]) if r["price"]>0 else 0
 
                 buy_reasons = []
                 if r["cycle_pct"] < 35:
@@ -972,8 +1069,7 @@ LOW: mixed signals — best to wait.
                     f"<div style='font-size:0.78rem;color:#16a34a;font-weight:600'>"
                     f"Deploy: HKD {alloc_hkd:,.0f} ({alloc_pct:.0f}%)</div>"
                     f"<div style='font-size:0.72rem;color:#64748b'>"
-                    f"{shares_sug:,} shares ({lots_sug:.0f} lots × {_lot:,}) · "
-                    f"Buy score: {r['buy_score']:.0f}/100</div>"
+                    f"~{shares_sug:,} shares · Buy score: {r['buy_score']:.0f}/100</div>"
                     f"</div></div>",
                     unsafe_allow_html=True)
         else:
@@ -1004,10 +1100,13 @@ LOW: mixed signals — best to wait.
                         s.at[i,"Net"]="color:#16a34a;font-weight:600"
                     elif net.startswith("SELL"):
                         s.at[i,"Net"]="color:#dc2626;font-weight:600"
-                    ss=int(str(row["Sell score"]))
-                    bs=int(str(row["Buy score"]))
-                    if ss>62: s.at[i,"Sell score"]="color:#dc2626;font-weight:700"
-                    if bs>62: s.at[i,"Buy score"]="color:#16a34a;font-weight:700"
+                    try:
+                        ss=float(str(row["Sell score"]).replace("%","").strip())
+                        bs=float(str(row["Buy score"]).replace("%","").strip())
+                        if ss>62: s.at[i,"Sell score"]="color:#dc2626;font-weight:700"
+                        if bs>62: s.at[i,"Buy score"]="color:#16a34a;font-weight:700"
+                    except (ValueError, TypeError):
+                        pass
                 return s
             st.dataframe(rot_df.style.apply(style_rot,axis=None),
                          use_container_width=True, hide_index=True)
@@ -1254,6 +1353,274 @@ LOW: mixed signals — best to wait.
                         st.rerun()
                     except Exception as e:
                         st.error(f"Save failed: {e}")
+
+    # ════════════════════════════════════════════════════════════════
+    # SECTION: TODAY'S FORECAST SUMMARY + RECORD ACTUALS
+    # ════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("### 📋 Today's Forecast & Record Actuals")
+
+    fc_tab1, fc_tab2 = st.tabs(["📊 Today's Estimates", "✅ Record Actual Results"])
+
+    with fc_tab1:
+        st.markdown(
+            "<span style='color:#64748b;font-size:0.8rem'>"
+            "Estimated P&L for each position if today's recommendations are followed. "
+            "Saved automatically each time you open this page.</span>",
+            unsafe_allow_html=True)
+
+        today_rows = [r for r in results if not r.get("error") and r.get("price")]
+        if today_rows:
+            fc_data = []
+            total_est = 0
+            for r in today_rows:
+                ep = r.get("est_pnl",0) or 0
+                total_est += ep
+                fc_data.append({
+                    "Name":       r["name"],
+                    "Ticker":     r["ticker"],
+                    "Action":     r.get("action","—").split("·")[0].strip(),
+                    "Confidence": r.get("confidence","—"),
+                    "Est. P&L":   f"{'+'if ep>=0 else ''}{ep:,.2f}",
+                    "Est. %":     f"{r.get('est_pnl_pct',0):+.2f}%",
+                    "Scenario":   r.get("est_note","—"),
+                })
+
+            total_c = "#16a34a" if total_est>=0 else "#dc2626"
+            st.markdown(
+                f"<div style='background:#f8fafc;border:1px solid #e2e8f0;"
+                f"border-radius:10px;padding:12px 16px;margin-bottom:10px'>"
+                f"<span style='font-size:0.8rem;color:#64748b'>Total estimated P&L today: </span>"
+                f"<span style='font-size:1.1rem;font-weight:700;color:{total_c}'>"
+                f"{'+'if total_est>=0 else ''}{total_est:,.2f}</span></div>",
+                unsafe_allow_html=True)
+
+            fc_df = pd.DataFrame(fc_data)
+            def _sty_fc(df):
+                s = pd.DataFrame("", index=df.index, columns=df.columns)
+                for i,row in df.iterrows():
+                    v = str(row["Est. P&L"])
+                    if v.startswith("+"): s.at[i,"Est. P&L"] = "color:#16a34a;font-weight:600"
+                    elif v.startswith("-"): s.at[i,"Est. P&L"] = "color:#dc2626;font-weight:600"
+                    c = str(row["Confidence"])
+                    if c == "HIGH": s.at[i,"Confidence"] = "color:#16a34a;font-weight:600"
+                    elif c == "LOW": s.at[i,"Confidence"] = "color:#94a3b8"
+                return s
+            st.dataframe(fc_df.style.apply(_sty_fc, axis=None),
+                         use_container_width=True, hide_index=True)
+
+    with fc_tab2:
+        st.markdown(
+            "<span style='color:#64748b;font-size:0.8rem'>"
+            "After market close, enter actual closing prices to record what really happened. "
+            "This builds your accuracy tracking over time.</span>",
+            unsafe_allow_html=True)
+
+        today_str2 = now_hk.strftime("%Y-%m-%d")
+        _init_forecast_db()
+        conn_ = get_conn()
+        import pandas as _pd2
+        today_fc = _pd2.read_sql_query(
+            "SELECT * FROM daily_forecast WHERE date=? ORDER BY ticker",
+            conn_, params=(today_str2,))
+        conn_.close()
+
+        if today_fc.empty:
+            st.info("No forecasts saved yet for today. Come back after the analysis runs.")
+        else:
+            st.markdown(f"**{len(today_fc)} positions forecast for {today_str2}**")
+
+            # Bulk auto-fetch close prices
+            bc1, bc2 = st.columns(2)
+            if bc1.button("⚡ Auto-fetch all close prices", key="fc_bulk"):
+                fetched = 0
+                for _, fc_row in today_fc.iterrows():
+                    t_ = fc_row["ticker"]
+                    qty_   = next((p["qty"] for p in all_pos if p["ticker"]==t_), 0)
+                    avg_c_ = next((p["avg_cost"] for p in all_pos if p["ticker"]==t_), 0)
+                    try:
+                        q_ = fetch_live(t_)
+                        cp_ = q_.get("price") or q_.get("prev")
+                        if cp_:
+                            update_actual(today_str2, t_, float(cp_), qty_, avg_c_)
+                            fetched += 1
+                        time.sleep(0.1)
+                    except Exception: pass
+                st.success(f"✅ Auto-recorded {fetched} positions!"); st.rerun()
+            bc2.markdown(
+                "<span style='font-size:0.78rem;color:#64748b'>"
+                "Or enter each price manually below.</span>",
+                unsafe_allow_html=True)
+            for _, fc_row in today_fc.iterrows():
+                ticker_ = fc_row["ticker"]
+                name_   = fc_row.get("name", ticker_)
+                ep_     = float(fc_row.get("est_pnl",0) or 0)
+                open_p_ = float(fc_row.get("open_price",0) or 0)
+                close_p_= fc_row.get("close_price")
+                correct_= fc_row.get("correct")
+
+                # Find qty from portfolio
+                qty_   = next((p["qty"] for p in all_pos if p["ticker"]==ticker_), 0)
+                avg_c_ = next((p["avg_cost"] for p in all_pos if p["ticker"]==ticker_), 0)
+
+                status_icon = ("✅" if correct_==1 else "❌" if correct_==0 else "⏳")
+                ep_c   = "#16a34a" if ep_>=0 else "#dc2626"
+
+                with st.expander(
+                    f"{status_icon} {name_} ({ticker_}) · "
+                    f"Forecast: {'+'if ep_>=0 else ''}{ep_:,.0f} · "
+                    f"{'Recorded ✓' if close_p_ else 'Pending'}"):
+                    rc1,rc2,rc3 = st.columns(3)
+                    rc1.markdown(
+                        f"<div style='text-align:center;background:#f8fafc;"
+                        f"border-radius:8px;padding:10px'>"
+                        f"<div style='font-size:0.68rem;color:#94a3b8'>Forecast P&L</div>"
+                        f"<div style='font-size:1rem;font-weight:700;color:{ep_c}'>"
+                        f"{'+'if ep_>=0 else ''}{ep_:,.2f}</div>"
+                        f"<div style='font-size:0.7rem;color:#64748b'>"
+                        f"{fc_row.get('action','—')}</div></div>",
+                        unsafe_allow_html=True)
+
+                    if close_p_:
+                        ap_ = float(fc_row.get("actual_pnl",0) or 0)
+                        ap_c = "#16a34a" if ap_>=0 else "#dc2626"
+                        rc2.markdown(
+                            f"<div style='text-align:center;background:#f8fafc;"
+                            f"border-radius:8px;padding:10px'>"
+                            f"<div style='font-size:0.68rem;color:#94a3b8'>Actual P&L</div>"
+                            f"<div style='font-size:1rem;font-weight:700;color:{ap_c}'>"
+                            f"{'+'if ap_>=0 else ''}{ap_:,.2f}</div>"
+                            f"<div style='font-size:0.7rem;color:#64748b'>"
+                            f"Close: {float(close_p_):,.4f}</div></div>",
+                            unsafe_allow_html=True)
+                        diff_ = float(fc_row.get("actual_pnl",0) or 0) - ep_
+                        _cc = "#16a34a" if correct_==1 else "#dc2626"
+                        _cl = "✅ Correct direction" if correct_==1 else "❌ Wrong direction"
+                        rc3.markdown(
+                            f"<div style='text-align:center;background:#f8fafc;"
+                            f"border-radius:8px;padding:10px'>"
+                            f"<div style='font-size:0.68rem;color:#94a3b8'>Diff (actual−est)</div>"
+                            f"<div style='font-size:1rem;font-weight:700;"
+                            f"color:{'#16a34a' if diff_>=0 else '#dc2626'}'>"
+                            f"{'+'if diff_>=0 else ''}{diff_:,.2f}</div>"
+                            f"<div style='font-size:0.7rem;color:{_cc}'>"
+                            f"{_cl}</div>"
+                            f"</div>",
+                            unsafe_allow_html=True)
+
+                    # Input close price
+                    inp_c1, inp_c2 = st.columns(2)
+                    new_close = inp_c1.number_input(
+                        "Enter close price",
+                        value=float(close_p_) if close_p_ else open_p_ or 0.0,
+                        step=0.01, format="%.4f",
+                        key=f"fc_close_{ticker_}")
+                    if inp_c2.button("💾 Record", key=f"fc_rec_{ticker_}"):
+                        update_actual(today_str2, ticker_, new_close, qty_, avg_c_)
+                        st.success(f"Recorded {ticker_}!"); st.rerun()
+
+    # ════════════════════════════════════════════════════════════════
+    # SECTION: ACCURACY HISTORY
+    # ════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("### 📈 Forecast Accuracy History")
+    st.markdown(
+        "<span style='color:#64748b;font-size:0.8rem'>"
+        "How accurate were the daily estimates vs actual results over time.</span>",
+        unsafe_allow_html=True)
+
+    hist_days = st.slider("Show last N days", 7, 90, 30, key="fc_hist_days")
+    hist_df = get_forecast_history(hist_days)
+
+    if hist_df.empty or "correct" not in hist_df.columns:
+        st.info("No historical data yet. Record actual results each day to build your accuracy history.")
+    else:
+        completed = hist_df.dropna(subset=["actual_pnl"])
+        if not completed.empty:
+            n_correct = int((completed["correct"]==1).sum())
+            n_total   = len(completed)
+            accuracy  = n_correct/n_total*100 if n_total>0 else 0
+            total_est_h = completed["est_pnl"].sum()
+            total_act_h = completed["actual_pnl"].sum()
+            avg_err   = (completed["actual_pnl"] - completed["est_pnl"]).mean()
+
+            h1,h2,h3,h4 = st.columns(4)
+            for col,lbl,val,color in [
+                (h1,"Direction accuracy", f"{accuracy:.0f}%",
+                 "#16a34a" if accuracy>=60 else "#f59e0b" if accuracy>=50 else "#dc2626"),
+                (h2,"Total est. P&L",     f"{'+'if total_est_h>=0 else ''}{total_est_h:,.0f}",
+                 "#16a34a" if total_est_h>=0 else "#dc2626"),
+                (h3,"Total actual P&L",   f"{'+'if total_act_h>=0 else ''}{total_act_h:,.0f}",
+                 "#16a34a" if total_act_h>=0 else "#dc2626"),
+                (h4,"Avg forecast error", f"{'+'if avg_err>=0 else ''}{avg_err:,.0f}",
+                 "#94a3b8"),
+            ]:
+                col.markdown(
+                    f"<div style='text-align:center;background:#f8fafc;"
+                    f"border-radius:10px;padding:10px 12px;border:1px solid #e2e8f0'>"
+                    f"<div style='font-size:0.68rem;color:#94a3b8'>{lbl}</div>"
+                    f"<div style='font-size:1rem;font-weight:700;color:{color}'>{val}</div>"
+                    f"</div>", unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Est vs actual chart
+            by_day = completed.groupby("date").agg(
+                est=("est_pnl","sum"), actual=("actual_pnl","sum")).reset_index()
+            fig_cmp = go.Figure()
+            fig_cmp.add_trace(go.Bar(
+                x=by_day["date"], y=by_day["est"],
+                name="Estimated", marker_color="#94a3b8", opacity=0.7))
+            fig_cmp.add_trace(go.Bar(
+                x=by_day["date"], y=by_day["actual"],
+                name="Actual",
+                marker_color=["#16a34a" if v>=0 else "#dc2626" for v in by_day["actual"]],
+                opacity=0.85))
+            fig_cmp.add_hline(y=0, line_color="#e2e8f0", line_width=1)
+            fig_cmp.update_layout(
+                height=280, barmode="group",
+                margin=dict(l=0,r=0,t=10,b=0),
+                plot_bgcolor="white", paper_bgcolor="white",
+                legend=dict(orientation="h", y=1.08),
+                xaxis=dict(gridcolor="#f1f5f9"),
+                yaxis=dict(title="P&L", gridcolor="#f1f5f9"))
+            st.plotly_chart(fig_cmp, use_container_width=True)
+
+            # Accuracy by ticker
+            by_ticker_h = completed.groupby("ticker").agg(
+                n=("correct","count"),
+                correct_n=("correct","sum"),
+                est_sum=("est_pnl","sum"),
+                act_sum=("actual_pnl","sum"),
+            ).reset_index()
+            by_ticker_h["accuracy"] = by_ticker_h["correct_n"]/by_ticker_h["n"]*100
+            by_ticker_h = by_ticker_h.sort_values("accuracy", ascending=False)
+            ticker_df = pd.DataFrame([{
+                "Ticker":    r["ticker"],
+                "Trades":    r["n"],
+                "Accuracy":  f"{r['accuracy']:.0f}%",
+                "Est total": f"{'+'if r['est_sum']>=0 else ''}{r['est_sum']:,.0f}",
+                "Actual total":f"{'+'if r['act_sum']>=0 else ''}{r['act_sum']:,.0f}",
+                "Diff":      f"{'+'if r['act_sum']-r['est_sum']>=0 else ''}{r['act_sum']-r['est_sum']:,.0f}",
+            } for _,r in by_ticker_h.iterrows()])
+            st.markdown("**Accuracy by position**")
+            def _sty_acc(df):
+                s = pd.DataFrame("", index=df.index, columns=df.columns)
+                for i,row in df.iterrows():
+                    try:
+                        acc = float(str(row["Accuracy"]).replace("%",""))
+                        if acc >= 65: s.at[i,"Accuracy"] = "color:#16a34a;font-weight:600"
+                        elif acc < 50: s.at[i,"Accuracy"] = "color:#dc2626;font-weight:600"
+                    except: pass
+                    for c in ["Est total","Actual total","Diff"]:
+                        v = str(row.get(c,""))
+                        if v.startswith("+"): s.at[i,c] = "color:#16a34a"
+                        elif v.startswith("-"): s.at[i,c] = "color:#dc2626"
+                return s
+            st.dataframe(ticker_df.style.apply(_sty_acc, axis=None),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.info("Record actual close prices using the tab above to see accuracy statistics.")
 
     st.markdown(
         "<span style='color:#94a3b8;font-size:0.74rem'>"

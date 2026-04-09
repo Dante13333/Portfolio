@@ -18,7 +18,6 @@ import time, pytz
 
 from db_manager import get_conn, get_portfolio_full, get_latest_capital, init_db
 from portfolio_manager import get_monitor_pos
-from lot_size import get_lot, round_to_lot, min_cost, init_lot_table, save_lot
 
 HK_TZ = pytz.timezone("Asia/Hong_Kong")
 
@@ -43,6 +42,17 @@ def init_risk_tables():
             setup       TEXT,
             notes       TEXT,
             status      TEXT DEFAULT 'OPEN',
+            logged_at   TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS signal_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            date        TEXT NOT NULL,
+            ticker      TEXT NOT NULL,
+            signal_type TEXT,
+            signal_val  TEXT,
+            recommended TEXT,
+            actual_next_day_pct REAL,
+            was_correct INTEGER,
             logged_at   TEXT DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS weekly_review (
@@ -141,7 +151,6 @@ def fetch_d(ticker, period="5d"):
 # ── MAIN RENDER ───────────────────────────────────────────────────────
 def render():
     init_risk_tables()
-    init_lot_table()
     now_hk = datetime.now(HK_TZ)
     capital = get_latest_capital()
 
@@ -401,27 +410,6 @@ If 4 positions all at 1.5% = 6% heat. If all stops hit → you lose 6%.
 - Exhaustion (>80%): 50% size or skip
             """)
 
-        # Lot size override
-        lot_col1, lot_col2, lot_col3 = st.columns(3)
-        ticker_for_size = lot_col1.text_input(
-            "Ticker (for auto lot size)", placeholder="0100.HK",
-            key="ps_lot_ticker").strip().upper()
-        if ticker_for_size:
-            auto_lot = get_lot(ticker_for_size, None)
-            detected = lot_col2.number_input(
-                "Board lot size", value=int(auto_lot), min_value=1, step=1,
-                key="ps_lot_val",
-                help="Auto-detected from HKEX rules. Override if needed.")
-            if lot_col3.button("💾 Save lot", key="ps_lot_save"):
-                save_lot(ticker_for_size, detected, "manual")
-                st.success(f"Saved {ticker_for_size} lot = {detected}")
-        else:
-            ticker_for_size = None
-            lot_col2.markdown(
-                "<span style='font-size:0.79rem;color:#64748b'>"
-                "Enter ticker above to auto-detect board lot</span>",
-                unsafe_allow_html=True)
-
         pc1, pc2 = st.columns(2)
         cap_   = pc1.number_input("Total capital (HKD)", value=float(capital),
                                     min_value=1000.0, step=10000.0, format="%.0f",
@@ -452,11 +440,7 @@ If 4 positions all at 1.5% = 6% heat. If all stops hit → you lose 6%.
             max_risk_hkd = cap_ * risk_pct_/100
             dist = entry_ - stop_
             shares_raw = max_risk_hkd / dist * cycle_mult
-            # Get board lot for ticker
-            _lot = get_lot(ticker_for_size, entry_) if ticker_for_size else 100
-            shares = round_to_lot(shares_raw, _lot)
-            min_lot_cost = _lot * entry_
-            if shares == 0: shares = _lot  # always at least 1 lot
+            shares = max(int(shares_raw), 1)
 
             cost      = shares * entry_
             act_risk  = shares * dist
@@ -484,26 +468,14 @@ If 4 positions all at 1.5% = 6% heat. If all stops hit → you lose 6%.
 
             st.markdown("<br>",unsafe_allow_html=True)
 
-            # Lot size note
-            _lot_disp = get_lot(ticker_for_size, entry_) if ticker_for_size else 100
-            st.markdown(
-                f"<div style='background:#f0f9ff;border:1px solid #bae6fd;"
-                f"border-radius:8px;padding:8px 12px;font-size:0.8rem;margin-bottom:8px'>"
-                f"📦 Board lot: <b>{_lot_disp:,} shares</b> · "
-                f"Min cost 1 lot: <b>HKD {_lot_disp*entry_:,.0f}</b> · "
-                f"Shares rounded to nearest lot of {_lot_disp:,}</div>",
-                unsafe_allow_html=True)
-
             # Scenario table
             st.markdown("**Size scenarios**")
-            _lot_s = get_lot(ticker_for_size, entry_) if ticker_for_size else 100
             scen_df = pd.DataFrame([{
-                "Risk %":      f"{rp:.1f}%",
-                "Max loss":    f"HKD {cap_*rp/100:,.0f}",
-                "Shares":      f"{round_to_lot(cap_*rp/100/dist*cycle_mult, _lot_s):,}",
-                "Lots":        f"{round_to_lot(cap_*rp/100/dist*cycle_mult, _lot_s)//_lot_s:.0f}",
-                "Cost":        f"HKD {round_to_lot(cap_*rp/100/dist*cycle_mult, _lot_s)*entry_:,.0f}",
-                "R:R":         f"1:{reward/max(round_to_lot(cap_*rp/100/dist*cycle_mult,_lot_s)*dist,1):.1f}",
+                "Risk %":  f"{rp:.1f}%",
+                "Max loss":f"HKD {cap_*rp/100:,.0f}",
+                "Shares":  f"{max(int(cap_*rp/100/dist*cycle_mult),1):,}",
+                "Cost":    f"HKD {max(int(cap_*rp/100/dist*cycle_mult),1)*entry_:,.0f}",
+                "R:R":     f"1:{reward/max(max(int(cap_*rp/100/dist*cycle_mult),1)*dist,1):.1f}",
             } for rp in [0.5,1.0,1.5,2.0,2.5,3.0]])
             st.dataframe(scen_df, use_container_width=True, hide_index=True)
 
@@ -734,8 +706,363 @@ If 4 positions all at 1.5% = 6% heat. If all stops hit → you lose 6%.
         wc2.metric("Wins / Losses",f"{w_won} / {w_lost}")
         wc3.metric("Win rate",    f"{w_won/(w_won+w_lost)*100:.0f}%" if w_won+w_lost>0 else "—")
 
+
+        # ── STRATEGY EVALUATION ──────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🎯 Strategy Evaluation — Was My Strategy Right?")
+        st.markdown(
+            "<span style='color:#64748b;font-size:0.8rem'>"
+            "Automated scoring of last week's recommendations vs what actually happened.</span>",
+            unsafe_allow_html=True)
+
+        if st.button("🔬 Run strategy evaluation", key="wr_eval"):
+            st.session_state["run_eval"] = True
+
+        if st.session_state.get("run_eval"):
+            import yfinance as yf
+
+            # ── 1. Trade signal accuracy ─────────────────────────────
+            st.markdown("#### 1 · Trade Signal Accuracy")
+            st.markdown(
+                "<span style='color:#64748b;font-size:0.79rem'>"
+                "Did the EXIT/REDUCE signals come before further losses? "
+                "Did the ADD/ENTER signals come before gains?</span>",
+                unsafe_allow_html=True)
+
+            if not week_trades.empty:
+                sig_rows = []
+                for _, tr in week_trades.iterrows():
+                    ticker_ = tr["ticker"]
+                    entry_d = pd.to_datetime(tr["date"])
+                    exit_d  = pd.to_datetime(tr.get("logged_at", tr["date"]))
+                    pnl_    = float(tr.get("pnl", 0) or 0)
+                    setup_  = tr.get("setup", "—")
+                    outcome_= tr.get("outcome", "—")
+
+                    # Fetch 5 days after exit to see what happened next
+                    try:
+                        df_after = fetch_d(ticker_, "10d")
+                        if not df_after.empty and len(df_after) >= 2:
+                            next_ret = float((df_after["Close"].iloc[-1] -
+                                              df_after["Close"].iloc[-2]) /
+                                             df_after["Close"].iloc[-2] * 100)
+                        else:
+                            next_ret = None
+                    except:
+                        next_ret = None
+
+                    direction_ = tr.get("direction", "LONG")
+                    # Was the exit timing good?
+                    if outcome_ == "WIN":
+                        timing = "✅ Good exit" if (next_ret is not None and (
+                            (direction_=="LONG" and next_ret < 0) or
+                            (direction_=="SHORT" and next_ret > 0))) else "⚠️ Left money"
+                    elif outcome_ == "LOSS":
+                        timing = "✅ Cut loss" if pnl_ > -500 else "⚠️ Late cut"
+                    else:
+                        timing = "—"
+
+                    sig_rows.append({
+                        "Date":      str(tr["date"])[:10],
+                        "Ticker":    ticker_,
+                        "Setup":     setup_,
+                        "Direction": direction_,
+                        "P&L":       f"{'+'if pnl_>=0 else ''}{pnl_:,.0f}",
+                        "Outcome":   outcome_,
+                        "Post-exit": f"{next_ret:+.2f}%" if next_ret is not None else "—",
+                        "Timing":    timing,
+                    })
+
+                if sig_rows:
+                    sig_df = pd.DataFrame(sig_rows)
+                    def _sty_sig(df):
+                        s = pd.DataFrame("", index=df.index, columns=df.columns)
+                        for i, row in df.iterrows():
+                            if str(row["Outcome"]) == "WIN":
+                                s.at[i,"Outcome"] = "color:#16a34a;font-weight:600"
+                            elif str(row["Outcome"]) == "LOSS":
+                                s.at[i,"Outcome"] = "color:#dc2626;font-weight:600"
+                            if "✅" in str(row["Timing"]):
+                                s.at[i,"Timing"] = "color:#16a34a"
+                            elif "⚠️" in str(row["Timing"]):
+                                s.at[i,"Timing"] = "color:#f59e0b"
+                            p = str(row["P&L"])
+                            if p.startswith("+"): s.at[i,"P&L"] = "color:#16a34a"
+                            elif p.startswith("-"): s.at[i,"P&L"] = "color:#dc2626"
+                        return s
+                    st.dataframe(sig_df.style.apply(_sty_sig, axis=None),
+                                 use_container_width=True, hide_index=True)
+            else:
+                st.info("No closed trades this week to evaluate.")
+
+            # ── 2. Cycle timing accuracy ──────────────────────────────
+            st.markdown("#### 2 · Cycle Timing — Did You Enter Early or Late?")
+            st.markdown(
+                "<span style='color:#64748b;font-size:0.79rem'>"
+                "For range trading, entering at <35% cycle progress = early = good. "
+                ">65% = late = bad timing.</span>",
+                unsafe_allow_html=True)
+
+            capital_ = get_latest_capital()
+            all_pos_ = []
+            try:
+                stock_df_ = get_portfolio_full()
+                if not stock_df_.empty:
+                    for _,r_ in stock_df_.iterrows():
+                        all_pos_.append({
+                            "ticker": r_["ticker"],
+                            "name":   r_.get("name", r_["ticker"]),
+                            "avg_cost": float(r_.get("avg_cost", 0) or 0),
+                        })
+            except: pass
+
+            if all_pos_:
+                cycle_rows = []
+                for pos_ in all_pos_:
+                    try:
+                        df_c = fetch_d(pos_["ticker"], "3mo")
+                        if df_c is None or len(df_c) < 20:
+                            continue
+                        closes_ = df_c["Close"]
+                        d_=closes_.diff(); g_=d_.clip(lower=0).ewm(com=13,adjust=False).mean()
+                        l_=(-d_.clip(upper=0)).ewm(com=13,adjust=False).mean()
+                        rsi_=float((100-100/(1+g_/l_.replace(0,np.nan))).dropna().iloc[-1])
+                        if len(closes_)>=20:
+                            mid_=closes_.rolling(20).mean(); std_=closes_.rolling(20).std()
+                            bb_=float(((closes_-mid_+2*std_)/(4*std_+1e-9)*100).clip(0,100).iloc[-1])
+                        else: bb_=50
+                        cycle_pct = rsi_/100*50 + bb_/100*50
+                        price_now_ = float(closes_.iloc[-1])
+                        avg_c_ = pos_["avg_cost"]
+                        ret_ = (price_now_-avg_c_)/avg_c_*100 if avg_c_>0 else 0
+
+                        if cycle_pct < 35:
+                            timing_q = "✅ Early (good)"
+                            t_c = "#16a34a"
+                        elif cycle_pct < 55:
+                            timing_q = "✅ Mid (OK)"
+                            t_c = "#16a34a"
+                        elif cycle_pct < 70:
+                            timing_q = "⚠️ Late"
+                            t_c = "#f59e0b"
+                        else:
+                            timing_q = "🔴 Peak zone"
+                            t_c = "#dc2626"
+
+                        cycle_rows.append({
+                            "Name":       pos_["name"],
+                            "Ticker":     pos_["ticker"],
+                            "Avg entry":  f"{avg_c_:,.2f}",
+                            "Now":        f"{price_now_:,.2f}",
+                            "Return %":   f"{ret_:+.2f}%",
+                            "RSI":        f"{rsi_:.0f}",
+                            "BB%":        f"{bb_:.0f}",
+                            "Cycle %":    f"{cycle_pct:.0f}%",
+                            "Timing":     timing_q,
+                            "_c":         t_c,
+                        })
+                    except: pass
+
+                if cycle_rows:
+                    cyc_df = pd.DataFrame(cycle_rows)
+                    def _sty_cyc(df):
+                        s = pd.DataFrame("", index=df.index, columns=df.columns)
+                        for i,row in df.iterrows():
+                            c_ = cycle_rows[i]["_c"]
+                            s.at[i,"Timing"] = f"color:{c_};font-weight:600"
+                            s.at[i,"Cycle %"] = f"color:{c_}"
+                            ret = str(row["Return %"])
+                            if ret.startswith("+"): s.at[i,"Return %"] = "color:#16a34a"
+                            elif ret.startswith("-"): s.at[i,"Return %"] = "color:#dc2626"
+                        return s
+                    disp_cyc = cyc_df[[c for c in cyc_df.columns if not c.startswith("_")]]
+                    st.dataframe(disp_cyc.style.apply(_sty_cyc, axis=None),
+                                 use_container_width=True, hide_index=True)
+
+                    early = sum(1 for r in cycle_rows if r["Cycle %"] < "50")
+                    late  = sum(1 for r in cycle_rows if r["Cycle %"] >= "65%")
+                    st.markdown(
+                        f"<span style='font-size:0.82rem;color:#64748b'>"
+                        f"Early entries: {early} · Late entries: {late} · "
+                        f"{'✅ Good timing overall' if early > late else '⚠️ Entering too late — wait for earlier cycle'}"
+                        f"</span>", unsafe_allow_html=True)
+
+            # ── 3. Sector flow alignment ──────────────────────────────
+            st.markdown("#### 3 · Sector Flow Alignment")
+            st.markdown(
+                "<span style='color:#64748b;font-size:0.79rem'>"
+                "Were you positioned in sectors with strong inflow? "
+                "Trading against the flow costs you.</span>",
+                unsafe_allow_html=True)
+
+            try:
+                from money_flow import get_flow_snapshot, get_ticker_sector
+                flow_snap_ = get_flow_snapshot("1mo")
+                if all_pos_ and flow_snap_:
+                    flow_rows = []
+                    for pos_ in all_pos_:
+                        sec_ = get_ticker_sector(pos_["ticker"]) or "—"
+                        fl_  = flow_snap_.get(sec_, 0)
+                        aligned = fl_ >= 20
+                        flow_rows.append({
+                            "Name":     pos_["name"],
+                            "Ticker":   pos_["ticker"],
+                            "Sector":   sec_,
+                            "Flow score": f"{fl_:+d}",
+                            "Aligned":  "✅ With flow" if aligned else
+                                        ("⚠️ Neutral" if fl_ > -20 else "🔴 Against flow"),
+                        })
+                    fl_df = pd.DataFrame(flow_rows)
+                    def _sty_fl(df):
+                        s = pd.DataFrame("", index=df.index, columns=df.columns)
+                        for i,row in df.iterrows():
+                            a = str(row["Aligned"])
+                            if "✅" in a: s.at[i,"Aligned"] = "color:#16a34a;font-weight:600"
+                            elif "🔴" in a: s.at[i,"Aligned"] = "color:#dc2626;font-weight:600"
+                            else: s.at[i,"Aligned"] = "color:#f59e0b"
+                            fl = int(str(row["Flow score"]).replace("+",""))
+                            if fl >= 20: s.at[i,"Flow score"] = "color:#16a34a;font-weight:600"
+                            elif fl <= -20: s.at[i,"Flow score"] = "color:#dc2626;font-weight:600"
+                        return s
+                    st.dataframe(fl_df.style.apply(_sty_fl, axis=None),
+                                 use_container_width=True, hide_index=True)
+                    aligned_n = sum(1 for r in flow_rows if "✅" in r["Aligned"])
+                    against_n = sum(1 for r in flow_rows if "🔴" in r["Aligned"])
+                    if against_n > 0:
+                        st.warning(
+                            f"⚠️ {against_n} position(s) are in sectors with outflow. "
+                            "This is a headwind — consider rotating to sectors with better flow.")
+            except Exception as e:
+                st.info(f"Flow data unavailable: {e}")
+
+            # ── 4. Strategy Health Score ──────────────────────────────
+            st.markdown("#### 4 · Strategy Health Score")
+
+            scores = {}
+            score_notes = []
+
+            # Signal accuracy
+            if not week_trades.empty and w_won + w_lost > 0:
+                wr_ = w_won / (w_won + w_lost) * 100
+                sig_score = min(wr_ * 1.5, 100)
+                scores["Signal accuracy"] = round(sig_score, 0)
+                if wr_ >= 55:
+                    score_notes.append(f"✅ Win rate {wr_:.0f}% — signals working")
+                elif wr_ >= 45:
+                    score_notes.append(f"⚠️ Win rate {wr_:.0f}% — marginal edge")
+                else:
+                    score_notes.append(f"🔴 Win rate {wr_:.0f}% — signals not working")
+            else:
+                scores["Signal accuracy"] = 50
+                score_notes.append("— No trades to evaluate")
+
+            # Cycle timing
+            if cycle_rows:
+                good_timing = sum(1 for r in cycle_rows
+                                  if float(r["Cycle %"].replace("%","")) < 55)
+                timing_score = good_timing / len(cycle_rows) * 100
+                scores["Cycle timing"] = round(timing_score, 0)
+                if timing_score >= 70:
+                    score_notes.append(f"✅ Cycle timing {timing_score:.0f}% — entering early")
+                elif timing_score >= 50:
+                    score_notes.append(f"⚠️ Cycle timing {timing_score:.0f}% — mixed")
+                else:
+                    score_notes.append(f"🔴 Cycle timing {timing_score:.0f}% — entering too late")
+            else:
+                scores["Cycle timing"] = 50
+
+            # Flow alignment
+            if "flow_rows" in dir() and flow_rows:
+                aligned_pct = aligned_n / len(flow_rows) * 100 if flow_rows else 50
+                scores["Flow alignment"] = round(aligned_pct, 0)
+                if aligned_pct >= 70:
+                    score_notes.append(f"✅ Flow alignment {aligned_pct:.0f}% — trading with money")
+                else:
+                    score_notes.append(f"⚠️ Flow alignment {aligned_pct:.0f}% — fighting some flows")
+            else:
+                scores["Flow alignment"] = 50
+
+            # P&L sign
+            if w_pnl > 0:
+                scores["P&L"] = 80
+                score_notes.append(f"✅ Profitable week +{w_pnl:,.0f}")
+            elif w_pnl == 0:
+                scores["P&L"] = 50
+            else:
+                scores["P&L"] = 20
+                score_notes.append(f"🔴 Losing week {w_pnl:,.0f}")
+
+            # Overall
+            overall = round(sum(scores.values()) / len(scores), 0)
+            overall_c = "#16a34a" if overall >= 65 else "#f59e0b" if overall >= 45 else "#dc2626"
+            overall_l = ("✅ Strategy working well" if overall >= 65
+                         else "⚠️ Needs adjustment" if overall >= 45
+                         else "🔴 Review strategy — not working")
+
+            st.markdown(
+                f"<div style='border:2px solid {overall_c};border-radius:12px;"
+                f"padding:16px 20px;background:rgba(0,0,0,0.02);margin-bottom:12px'>"
+                f"<div style='font-size:1.3rem;font-weight:800;color:{overall_c}'>"
+                f"Strategy Health: {overall:.0f}/100 — {overall_l}</div>"
+                f"</div>", unsafe_allow_html=True)
+
+            # Component scores radar-style bar
+            fig_health = go.Figure()
+            cats = list(scores.keys())
+            vals = list(scores.values())
+            colors_ = ["#16a34a" if v>=65 else "#f59e0b" if v>=45 else "#dc2626" for v in vals]
+            fig_health.add_trace(go.Bar(
+                x=cats, y=vals,
+                marker_color=colors_, opacity=0.85,
+                text=[f"{v:.0f}" for v in vals],
+                textposition="outside"))
+            fig_health.add_hline(y=65, line_dash="dot", line_color="#16a34a",
+                                  line_width=1, annotation_text="Good (65)",
+                                  annotation_position="right")
+            fig_health.add_hline(y=45, line_dash="dot", line_color="#f59e0b",
+                                  line_width=1, annotation_text="Marginal (45)",
+                                  annotation_position="right")
+            fig_health.update_layout(height=220, margin=dict(l=0,r=80,t=10,b=0),
+                plot_bgcolor="white", paper_bgcolor="white",
+                yaxis=dict(range=[0,110], gridcolor="#f1f5f9"),
+                xaxis=dict(gridcolor="#f1f5f9"))
+            st.plotly_chart(fig_health, use_container_width=True)
+
+            for note in score_notes:
+                c_ = "#16a34a" if "✅" in note else "#f59e0b" if "⚠️" in note else "#dc2626"
+                st.markdown(
+                    f"<div style='font-size:0.82rem;color:{c_};"
+                    f"padding:4px 0'>{note}</div>",
+                    unsafe_allow_html=True)
+
+            # ── Next week priorities ──────────────────────────────────
+            st.markdown("#### 5 · Recommended Focus for Next Week")
+            priorities = []
+            if scores.get("Signal accuracy", 50) < 45:
+                priorities.append("📌 Review signal settings — win rate too low. "
+                    "Check if RSI thresholds match this stock's behaviour in Strategy page.")
+            if scores.get("Cycle timing", 50) < 50:
+                priorities.append("📌 Wait for earlier cycle entry — you are buying too late. "
+                    "Only enter when Cycle ML shows <35% progress.")
+            if scores.get("Flow alignment", 50) < 60:
+                priorities.append("📌 Check Money Flow page before trading — "
+                    "align positions with sectors showing inflow (score >20).")
+            if w_pnl < 0 and w_won + w_lost >= 3:
+                priorities.append("📌 Reduce position sizes this week — "
+                    "preserve capital until win rate recovers.")
+            if not priorities:
+                priorities.append("✅ Strategy looks healthy — maintain discipline "
+                    "and keep position sizes consistent.")
+            for p_ in priorities:
+                st.markdown(
+                    f"<div style='border-left:3px solid #2563eb;padding:8px 12px;"
+                    f"background:rgba(37,99,235,0.04);border-radius:0 6px 6px 0;"
+                    f"font-size:0.82rem;margin-bottom:6px'>{p_}</div>",
+                    unsafe_allow_html=True)
+
         st.markdown("---")
         st.markdown("**Write your weekly review**")
+
 
         wrc1,wrc2 = st.columns(2)
         w_notes   = wrc1.text_area("What worked this week?", height=100,
