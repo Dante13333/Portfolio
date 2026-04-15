@@ -16,10 +16,20 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import time, pytz
 
-from db_manager import get_conn, get_portfolio_full, get_latest_capital, init_db
+from db_manager import get_conn, get_portfolio_full, get_latest_capital, save_capital, get_capital_history, init_db
 from portfolio_manager import get_monitor_pos
 
 HK_TZ = pytz.timezone("Asia/Hong_Kong")
+
+# ── TRANSACTION COSTS ─────────────────────────────────────────────────
+_COMM_RATE = 0.00028; _COMM_MIN = 28; _STAMP = 0.001
+
+def _tx_cost(value, is_buy=True):
+    return round(max(value*_COMM_RATE, _COMM_MIN) + (value*_STAMP if is_buy else 0), 2)
+
+def _net_pnl(gross, buy_val, sell_val):
+    return round(gross - _tx_cost(buy_val, True) - _tx_cost(sell_val, False), 2)
+
 
 # ── DB SETUP ──────────────────────────────────────────────────────────
 def init_risk_tables():
@@ -91,6 +101,13 @@ def log_trade(date, ticker, name, direction, entry, exit_p, shares,
     """, (date,ticker,name,direction,entry,exit_p,shares,
           stop,target,pnl,pnl_pct,outcome,setup,notes,status))
     conn.commit(); conn.close()
+    if status == "OPEN" and entry and shares:
+        try:
+            bv  = float(entry)*float(shares)
+            btx = max(bv*0.00028, 28) + bv*0.001
+            save_capital(round(get_latest_capital()-bv-btx, 2),
+                f"BUY {ticker} ×{float(shares):.0f} @{float(entry):.4f} cost {bv:,.0f}+tx {btx:,.0f}")
+        except Exception: pass
 
 def close_trade(trade_id, exit_price, notes=""):
     conn = get_conn()
@@ -98,15 +115,24 @@ def close_trade(trade_id, exit_price, notes=""):
         "SELECT * FROM trade_log WHERE id=?", conn, params=(trade_id,)).iloc[0]
     entry = float(row["entry_price"]); shares = float(row["shares"])
     direction = row["direction"]
-    pnl = (exit_price-entry)*shares if direction=="LONG" else (entry-exit_price)*shares
+    gross   = (exit_price-entry)*shares if direction=="LONG" else (entry-exit_price)*shares
+    sv      = exit_price*shares
+    stx     = max(sv*0.00028, 28)
+    net_pnl = round(gross-stx, 2)
     pnl_pct = (exit_price-entry)/entry*100 if direction=="LONG" else (entry-exit_price)/entry*100
-    outcome = "WIN" if pnl>0 else "LOSS" if pnl<0 else "BREAK EVEN"
+    outcome = "WIN" if net_pnl>0 else "LOSS" if net_pnl<0 else "BREAK EVEN"
+    ticker_ = str(row["ticker"])
     conn.execute("""
         UPDATE trade_log SET exit_price=?,pnl=?,pnl_pct=?,outcome=?,status='CLOSED',
         notes=COALESCE(notes,'')||?,logged_at=datetime('now') WHERE id=?
-    """, (exit_price, round(pnl,2), round(pnl_pct,2), outcome,
+    """, (exit_price, net_pnl, round(pnl_pct,2), outcome,
           f" | Exit: {notes}" if notes else "", trade_id))
     conn.commit(); conn.close()
+    try:
+        proceeds = sv - stx
+        save_capital(round(get_latest_capital()+proceeds, 2),
+            f"SELL {ticker_} ×{shares:.0f} @{exit_price:.4f} proceeds {sv:,.0f}-tx {stx:,.0f}={proceeds:,.0f} P&L {net_pnl:+,.0f}")
+    except Exception: pass
 
 def save_weekly_review(ws, we, pnl, won, lost, best, worst, notes, lessons):
     conn = get_conn()
@@ -610,6 +636,34 @@ If 4 positions all at 1.5% = 6% heat. If all stops hit → you lose 6%.
                             f"<div style='font-size:0.68rem;color:#94a3b8'>{lbl}</div>"
                             f"<div style='font-size:1rem;font-weight:700;color:{color}'>{val}</div>"
                             f"</div>", unsafe_allow_html=True)
+
+                    # Capital balance chart
+                    try:
+                        cap_hist = get_capital_history()
+                        if not cap_hist.empty and len(cap_hist)>1:
+                            cap_hist = cap_hist.sort_values("recorded_at")
+                            cap_now  = float(cap_hist["amount"].iloc[-1])
+                            cap_s    = float(cap_hist["amount"].iloc[0])
+                            cap_c    = "#16a34a" if cap_now>=cap_s else "#dc2626"
+                            st.markdown(
+                                f"<div style='background:#f8fafc;border:1px solid #e2e8f0;"
+                                f"border-radius:8px;padding:8px 14px;font-size:0.82rem;margin-bottom:6px'>"
+                                f"Current capital: <b>HKD {cap_now:,.0f}</b> · "
+                                f"Net change: <b style='color:{cap_c}'>{cap_now-cap_s:+,.0f}</b></div>",
+                                unsafe_allow_html=True)
+                            fig_cap = go.Figure(go.Scatter(
+                                x=cap_hist["recorded_at"], y=cap_hist["amount"],
+                                mode="lines+markers",
+                                line=dict(color="#2563eb",width=2),
+                                fill="tozeroy", fillcolor="rgba(37,99,235,0.07)",
+                                hovertemplate="%{x}<br>HKD %{y:,.0f}<extra></extra>"))
+                            fig_cap.update_layout(height=180,margin=dict(l=0,r=0,t=20,b=0),
+                                title=dict(text="Capital over time",font=dict(size=11)),
+                                plot_bgcolor="white",paper_bgcolor="white",
+                                xaxis=dict(gridcolor="#f1f5f9"),
+                                yaxis=dict(gridcolor="#f1f5f9"))
+                            st.plotly_chart(fig_cap,use_container_width=True)
+                    except Exception: pass
 
                     # Cumulative P&L chart
                     st.markdown("<br>",unsafe_allow_html=True)

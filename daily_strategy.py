@@ -78,6 +78,9 @@ def update_actual(date, ticker, close_price, qty, avg_cost):
         conn.close(); return
     open_p = row[1] or avg_cost
     actual_pnl = (close_price - open_p) * qty if qty > 0 else 0
+    # Deduct sell-side transaction cost from actual P&L
+    if qty > 0:
+        actual_pnl -= tx_cost(close_price * qty, is_buy=False)
     actual_pct = (close_price - open_p) / open_p * 100 if open_p > 0 else 0
     est_pnl    = row[0] or 0
     # Correct if actual_pnl and est_pnl have same sign, or action was EXIT and pnl > 0
@@ -107,6 +110,31 @@ except Exception:
     _get_flow = lambda t, p='1mo': {}
 
 HK_TZ = pytz.timezone("Asia/Hong_Kong")
+
+# ── TRANSACTION COSTS ─────────────────────────────────────────────────
+# HKEX: 0.028% commission (min HKD 28 per side) + 0.1% stamp duty (buy only)
+COMMISSION_RATE = 0.00028   # 0.028%
+COMMISSION_MIN  = 28        # HKD 28 minimum per transaction
+STAMP_DUTY_RATE = 0.001     # 0.1% on buy side only
+
+def tx_cost(value: float, is_buy: bool = True) -> float:
+    """
+    Total transaction cost for one side of a trade.
+    value = trade_value (price × shares)
+    is_buy = True for buy, False for sell
+    """
+    commission = max(value * COMMISSION_RATE, COMMISSION_MIN)
+    stamp      = value * STAMP_DUTY_RATE if is_buy else 0
+    return round(commission + stamp, 2)
+
+def round_trip_cost(buy_value: float, sell_value: float) -> float:
+    """Total cost for a complete buy + sell cycle."""
+    return tx_cost(buy_value, True) + tx_cost(sell_value, False)
+
+def net_pnl(gross_pnl: float, buy_value: float, sell_value: float) -> float:
+    """Gross P&L minus round-trip transaction costs."""
+    return round(gross_pnl - round_trip_cost(buy_value, sell_value), 2)
+
 
 SESSIONS = [
     ("Open",      9,  30, 10,  0),
@@ -174,6 +202,176 @@ def fetch_intraday(ticker):
         except Exception: pass
     return pd.DataFrame()
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_weekly(ticker):
+    """Fetch weekly OHLCV for macro cycle detection."""
+    for t in _var(ticker):
+        try:
+            df = yf.Ticker(t).history(period="12mo", interval="1wk", auto_adjust=True)
+            if len(df) >= 10: return df
+        except Exception: pass
+    return pd.DataFrame()
+
+
+def detect_cycle(ticker, df_daily, df_intraday, df_weekly=None):
+    """
+    Multi-timeframe cycle detection.
+    Returns dict with macro/meso/micro cycle positions (0-100%)
+    and a combined score with conflict flags.
+
+    0% = cycle trough (buy zone)
+    100% = cycle peak (sell zone)
+    50% = mid-cycle
+
+    Each timeframe uses three signals combined:
+      1. ZigZag-like turning points (ATR-based)
+      2. RSI position
+      3. Volume weight (surge = new cycle start, dry = exhaustion)
+    """
+    result = {
+        "macro_pct":   50, "macro_label": "—", "macro_signal": "—",
+        "meso_pct":    50, "meso_label":  "—", "meso_signal":  "—",
+        "micro_pct":   50, "micro_label": "—", "micro_signal": "—",
+        "combined":    50, "dominant":    "meso",
+        "conflict":    False, "conflict_note": "",
+        "action_bias": "NEUTRAL",
+    }
+
+    # ── MACRO cycle (weekly, 1-3 months) ─────────────────────────────
+    try:
+        df_w = df_weekly if (df_weekly is not None and len(df_weekly)>=10) else pd.DataFrame()
+        if df_w.empty and len(df_daily)>=60:
+            # Resample daily to weekly
+            df_w = df_daily.resample("W").agg({
+                "Open":"first","High":"max","Low":"min",
+                "Close":"last","Volume":"sum"}).dropna()
+
+        if len(df_w) >= 10:
+            c_w  = df_w["Close"]
+            rsi_w = _rsi(c_w, 10)
+            # ATR-based range position on weekly
+            atr_w = float((df_w["High"]-df_w["Low"]).ewm(com=9,adjust=False).mean().iloc[-1])
+            mid_w = float(c_w.rolling(10).mean().iloc[-1])
+            pos_w = (float(c_w.iloc[-1]) - (mid_w - 2*atr_w)) / (4*atr_w + 1e-9) * 100
+            pos_w = max(0, min(100, pos_w))
+            # Volume: recent 4wk vs 12wk avg
+            vol_w = df_w["Volume"]
+            vr_w  = float(vol_w.tail(4).mean()) / float(vol_w.mean() + 1e-9)
+            # Volume surge near low = accumulation = early cycle
+            vol_signal_w = max(0, min(1, (vr_w - 0.8) / 1.2))  # 0=low vol, 1=high vol
+            # Combine: RSI(40%) + price position(40%) + volume(20%)
+            macro_pct = rsi_w * 0.40 + pos_w * 0.40 + vol_signal_w * 100 * 0.20
+            macro_pct = round(max(0, min(100, macro_pct)), 1)
+            result["macro_pct"] = macro_pct
+            if macro_pct >= 75:    result["macro_label"] = "🔴 Peak"; result["macro_signal"] = "Macro cycle near peak — expect pullback"
+            elif macro_pct >= 55:  result["macro_label"] = "🟡 Late"; result["macro_signal"] = "Macro late cycle — reduce new positions"
+            elif macro_pct >= 35:  result["macro_label"] = "🟢 Mid";  result["macro_signal"] = "Macro mid-cycle — trend intact"
+            else:                  result["macro_label"] = "✅ Early"; result["macro_signal"] = "Macro early cycle — strong buy zone"
+    except Exception:
+        pass
+
+    # ── MESO cycle (daily, 1-3 weeks) ────────────────────────────────
+    try:
+        if len(df_daily) >= 20:
+            c_d   = df_daily["Close"]
+            rsi_d = _rsi(c_d, 14)
+            # BB position (0=lower band, 100=upper band)
+            bb_d  = _bb(c_d, 20)
+            # ATR-based cycle position
+            atr_d = _atr(df_daily, 14)
+            mid_d = float(c_d.rolling(20).mean().iloc[-1])
+            pos_d = (float(c_d.iloc[-1]) - (mid_d - 2*atr_d)) / (4*atr_d + 1e-9) * 100
+            pos_d = max(0, min(100, pos_d))
+            # Volume: 5d vs 20d avg
+            vol_d = df_daily["Volume"]
+            vr_d  = float(vol_d.tail(5).mean()) / float(vol_d.rolling(20).mean().iloc[-1] + 1e-9)
+            # ZigZag: detect recent trough (last time RSI was <30 or BB<10)
+            rsi_series = c_d.rolling(1).apply(lambda x: _rsi(c_d.iloc[:c_d.index.get_loc(x.index[-1])+1],14) if len(c_d)>14 else 50, raw=False)
+            # Simplified: days since RSI was last oversold
+            try:
+                rsi_hist = [float(_rsi(c_d.iloc[max(0,i-14):i+1],14)) for i in range(max(14,len(c_d)-30), len(c_d))]
+                days_since_trough = next((len(rsi_hist)-1-i for i,v in enumerate(reversed(rsi_hist)) if v<35), 15)
+                trough_recency = max(0, 1 - days_since_trough/15)  # 1=just had trough, 0=long ago
+            except:
+                trough_recency = 0
+            # Combine: RSI(35%) + BB(35%) + vol(15%) + trough recency(15%)
+            meso_pct = rsi_d*0.35 + bb_d*0.35 + min(vr_d,2)/2*100*0.15 + (1-trough_recency)*100*0.15
+            meso_pct = round(max(0, min(100, meso_pct)), 1)
+            result["meso_pct"] = meso_pct
+            if meso_pct >= 75:    result["meso_label"] = "🔴 Peak"; result["meso_signal"] = "Meso cycle peak — take profit"
+            elif meso_pct >= 55:  result["meso_label"] = "🟡 Late"; result["meso_signal"] = "Meso late — tighten stop"
+            elif meso_pct >= 35:  result["meso_label"] = "🟢 Mid";  result["meso_signal"] = "Meso mid-cycle — hold"
+            else:                 result["meso_label"] = "✅ Early"; result["meso_signal"] = "Meso early — best entry window"
+    except Exception:
+        pass
+
+    # ── MICRO cycle (15min, 1-3 days) ────────────────────────────────
+    try:
+        if not df_intraday.empty and len(df_intraday) >= 10:
+            c_i   = df_intraday["Close"]
+            rsi_i = _rsi(c_i, min(14, len(c_i)-1))
+            # BB position on 15min
+            bb_i  = _bb(c_i, min(20, len(c_i)-1))
+            # VWAP position
+            vwap_i = float(((df_intraday["High"]+df_intraday["Low"]+df_intraday["Close"])/3
+                            *df_intraday["Volume"]).cumsum()
+                           / df_intraday["Volume"].cumsum().iloc[-1])
+            price_now = float(c_i.iloc[-1])
+            vwap_pos  = 50 + (price_now - vwap_i) / (price_now * 0.02 + 1e-9) * 25
+            vwap_pos  = max(0, min(100, vwap_pos))
+            # Volume: last 3 bars vs session avg
+            vol_i = df_intraday["Volume"]
+            vr_i  = float(vol_i.tail(3).mean()) / float(vol_i.mean() + 1e-9)
+            # Combine: RSI(35%) + BB(35%) + VWAP(20%) + volume(10%)
+            micro_pct = rsi_i*0.35 + bb_i*0.35 + vwap_pos*0.20 + min(vr_i,2)/2*100*0.10
+            micro_pct = round(max(0, min(100, micro_pct)), 1)
+            result["micro_pct"] = micro_pct
+            if micro_pct >= 75:   result["micro_label"] = "🔴 Peak"; result["micro_signal"] = "Micro overbought — wait for pullback"
+            elif micro_pct >= 55: result["micro_label"] = "🟡 Late"; result["micro_signal"] = "Micro late — enter smaller"
+            elif micro_pct >= 35: result["micro_label"] = "🟢 Mid";  result["micro_signal"] = "Micro neutral"
+            else:                 result["micro_label"] = "✅ Early"; result["micro_signal"] = "Micro oversold — intraday buy signal"
+    except Exception:
+        pass
+
+    # ── Combined score + conflict detection ───────────────────────────
+    mac = result["macro_pct"]
+    mes = result["meso_pct"]
+    mic = result["micro_pct"]
+
+    # Dominant cycle: meso drives the primary trade, macro gives context,
+    # micro gives timing. Weight: macro 20%, meso 50%, micro 30%
+    combined = round(mac*0.20 + mes*0.50 + mic*0.30, 1)
+    result["combined"] = combined
+
+    # Dominant: whichever cycle is most extreme (furthest from 50)
+    dists = {"macro": abs(mac-50), "meso": abs(mes-50), "micro": abs(mic-50)}
+    result["dominant"] = max(dists, key=dists.get)
+
+    # Conflict detection
+    conflicts = []
+    if mac < 35 and mes > 65:
+        conflicts.append("Macro early but meso late — meso may be topping within larger uptrend")
+    if mac > 65 and mes < 35:
+        conflicts.append("Macro late but meso early — meso bounce within larger downtrend, caution")
+    if mes < 35 and mic > 65:
+        conflicts.append("Meso early (buy zone) but micro overbought — wait for micro to reset before entering")
+    if mes > 65 and mic < 35:
+        conflicts.append("Meso at peak but micro oversold — possible last dip before peak, risky entry")
+    if conflicts:
+        result["conflict"] = True
+        result["conflict_note"] = " · ".join(conflicts)
+
+    # Action bias
+    if combined < 30:      result["action_bias"] = "STRONG BUY"
+    elif combined < 40:    result["action_bias"] = "BUY"
+    elif combined < 55:    result["action_bias"] = "HOLD"
+    elif combined < 65:    result["action_bias"] = "REDUCE"
+    elif combined < 75:    result["action_bias"] = "SELL"
+    else:                  result["action_bias"] = "STRONG SELL"
+
+    return result
+
 # ── INDICATORS ────────────────────────────────────────────────────────
 def _rsi(s,p=14):
     d=s.diff(); g=d.clip(lower=0).ewm(com=p-1,adjust=False).mean()
@@ -227,7 +425,19 @@ def analyse_position(ticker, name, avg_cost, qty, target, stop,
     """
     q   = fetch_live(ticker)
     df  = fetch_daily(ticker)
+    df6 = fetch_daily(ticker, "6mo")   # longer history for macro
     dfi = fetch_intraday(ticker)
+
+    # Multi-timeframe cycle detection
+    try:
+        df_w = fetch_weekly(ticker)
+        cycle = detect_cycle(ticker, df6 if not df6.empty else df, dfi, df_w)
+    except Exception:
+        cycle = {"macro_pct":50,"meso_pct":50,"micro_pct":50,"combined":50,
+                 "macro_label":"—","meso_label":"—","micro_label":"—",
+                 "conflict":False,"conflict_note":"","action_bias":"NEUTRAL",
+                 "macro_signal":"—","meso_signal":"—","micro_signal":"—",
+                 "dominant":"meso"}
 
     price = q.get("price")
     prev  = q.get("prev")
@@ -257,12 +467,27 @@ def analyse_position(ticker, name, avg_cost, qty, target, stop,
         vol_r  = _vol_ratio(df)
         atr_v  = _atr(df)
         slope  = _trend_slope(df["Close"])
+        # Earning efficiency
+        _avg_r_pct = float((df["High"]-df["Low"]).mean()) / float(df["Close"].mean()) * 100
+        _ann_vol   = float(df["Close"].pct_change().dropna().std() * (252**0.5) * 100)
+        _chop_f    = max((chop_v-38)/(61.8-38), 0)
+        _wr        = float((df["Close"].pct_change().dropna()>0).mean()*100)
+        earn_eff   = (_avg_r_pct * _chop_f * (_wr/100)) / (_ann_vol/100 + 0.01)
         ma20   = float(df["Close"].rolling(20).mean().iloc[-1])
         ma50   = float(df["Close"].rolling(50).mean().iloc[-1]) if len(df)>=50 else None
 
         signals["rsi"]     = round(rsi_v,1)
         signals["macd_h"]  = round(macd_h,4)
         signals["bb_pct"]  = round(bb_v,1)
+        # BB absolute levels for entry price calculation
+        _bb_mid   = float(df["Close"].rolling(20).mean().iloc[-1])
+        _bb_std   = float(df["Close"].rolling(20).std().iloc[-1])
+        bb_lower  = round(_bb_mid - 2*_bb_std, 4)
+        bb_upper  = round(_bb_mid + 2*_bb_std, 4)
+        bb_mid    = round(_bb_mid, 4)
+        signals["bb_lower"] = bb_lower
+        signals["bb_upper"] = bb_upper
+        signals["bb_mid"]   = bb_mid
         signals["chop"]    = round(chop_v,1)
         signals["vol_r"]   = round(vol_r,2)
         signals["atr"]     = round(atr_v,2)
@@ -313,7 +538,8 @@ def analyse_position(ticker, name, avg_cost, qty, target, stop,
         else:
             signals["chop_signal"]="Mixed"
     else:
-        atr_v=price*0.02; chop_v=50; rsi_v=50
+        atr_v=price*0.02; chop_v=50; rsi_v=50; slope=0.0; earn_eff=0.0
+        bb_lower=price*0.96; bb_upper=price*1.04; bb_mid=price
 
     # ── Intraday context ──────────────────────────────────────────────
     if not dfi.empty and len(dfi)>4:
@@ -492,6 +718,71 @@ def analyse_position(ticker, name, avg_cost, qty, target, stop,
     atr_stop  = round(price - 1.5*atr_v, 4)
     atr_target= round(price + 2.5*atr_v, 4)
 
+    # ── Target Type 1: Intraday high-volatility target ─────────────────
+    # Based on today's expected range from ATR + opening range behaviour
+    # Goal: capture 60-70% of daily range within the session
+    avg_daily_range = atr_v           # ATR ≈ avg daily range
+    today_remaining = avg_daily_range  # conservative: full ATR from here
+
+    # If day high/low already set, use remaining range
+    if dh and dl:
+        range_used  = dh - dl
+        range_left  = max(avg_daily_range - range_used, avg_daily_range * 0.3)
+    else:
+        range_left  = avg_daily_range
+
+    # Intraday target: price + 65% of expected remaining range
+    intraday_target = round(price + range_left * 0.65, 4)
+    intraday_stop   = round(price - range_left * 0.40, 4)  # tighter — intraday exit fast
+    intraday_rr     = round((intraday_target-price) / max(price-intraday_stop, 0.0001), 2)
+
+    # Intraday P&L estimate (net of sell-side commission — already bought)
+    intraday_gross  = (intraday_target - price) * qty if qty > 0 else (intraday_target - price) * 100
+    intraday_pnl    = round(intraday_gross - tx_cost(intraday_target * (qty or 100), False), 2)
+
+    # ── Target Type 2: 2-3 day swing target ───────────────────────────
+    # Based on short-cycle amplitude: 2-3 days of range
+    # Use ATR × 2.0 (2 days of average range) as the swing target
+    # Adjusted for choppiness — oscillating stocks have cleaner 2-3d cycles
+    chop_mult  = 1.2 if chop_v >= 61.8 else 1.0 if chop_v >= 50 else 0.8
+    swing_days = 2.5  # target: capture 2-3 day range
+    swing_amp  = atr_v * swing_days * chop_mult
+
+    swing_target = round(price + swing_amp, 4)
+    swing_stop   = round(price - atr_v * 1.2, 4)   # wider than intraday
+    swing_rr     = round((swing_target-price) / max(price-swing_stop, 0.0001), 2)
+
+    # Swing P&L estimate (round trip costs for new entry scenario)
+    swing_qty     = qty if qty > 0 else 100
+    swing_gross   = (swing_target - price) * swing_qty
+    swing_pnl     = round(swing_gross - tx_cost(swing_target * swing_qty, False), 2)
+
+    # ── Suitability filter ────────────────────────────────────────────
+    # Don't recommend targets when the instrument is not suitable for range trading:
+    # 1. Downtrend (slope < -0.15 = consistent downward drift)
+    # 2. Not oscillating enough (choppiness < 45 = directional / trending)
+    # 3. R:R too low to be worth the trade (< 1.0)
+    _downtrend   = slope < -0.15
+    _not_oscillating = chop_v < 45
+    _poor_rr_intraday = intraday_rr < 1.0
+    _poor_rr_swing    = swing_rr    < 1.2
+
+    _intraday_suitable = not _downtrend and not _poor_rr_intraday
+    _swing_suitable    = not _downtrend and not _not_oscillating and not _poor_rr_swing
+
+    # Build rejection reason strings
+    _intraday_reason = None
+    _swing_reason    = None
+    if _downtrend:
+        _intraday_reason = f"Downtrend (slope {slope:+.3f}) — avoid long targets"
+        _swing_reason    = f"Downtrend (slope {slope:+.3f}) — not suitable for swing"
+    if _not_oscillating and not _swing_reason:
+        _swing_reason = f"Choppiness {chop_v:.0f} < 45 — trending, not oscillating enough"
+    if _poor_rr_intraday and not _intraday_reason:
+        _intraday_reason = f"R:R {intraday_rr:.1f} < 1.0 — range too small vs risk"
+    if _poor_rr_swing and not _swing_reason:
+        _swing_reason = f"R:R {swing_rr:.1f} < 1.2 — swing amplitude insufficient"
+
     if stop and abs(stop-atr_stop)/price<0.03:
         stop_note="Current stop aligned with ATR — OK"
         stop_color="#16a34a"
@@ -517,39 +808,99 @@ def analyse_position(ticker, name, avg_cost, qty, target, stop,
     eff_stop   = stop   if stop   else atr_stop
     eff_target = target if target else atr_target
 
+    # ── Suggested entry price ─────────────────────────────────────────
+    # For ADD / ENTER / WAIT — where is the ideal price to buy?
+    # Priority: 1) BB lower band (oversold zone, best for range entry)
+    #           2) VWAP (intraday fair value — institutional reference)
+    #           3) MA20 (medium-term support)
+    #           4) ATR-based pullback from current price
+    # Use whichever is closest to current price from below
+    _vwap = signals.get("vwap")
+    _ma20 = signals.get("ma20", price)
+
+    # Candidate entry levels (must be below or at current price)
+    entry_candidates = []
+    if bb_lower and bb_lower < price:
+        entry_candidates.append(("BB lower band", round(bb_lower, 4)))
+    if bb_lower and bb_lower >= price:  # already at lower band — buy now
+        entry_candidates.append(("BB lower band (at band)", round(bb_lower, 4)))
+    if _vwap and _vwap < price * 1.005:
+        entry_candidates.append(("VWAP", round(float(_vwap), 4)))
+    if _ma20 and _ma20 < price * 1.01:
+        entry_candidates.append(("MA20", round(float(_ma20), 4)))
+    # ATR pullback: current price minus 0.5 ATR
+    entry_candidates.append(("ATR pullback (−0.5×ATR)", round(price - 0.5*atr_v, 4)))
+
+    # Best entry = closest level to current price from below, but above stop
+    valid = [(lbl, lvl) for lbl, lvl in entry_candidates
+             if lvl >= eff_stop and lvl <= price * 1.01]
+    if valid:
+        # Pick the highest (closest to current price) = soonest hit
+        best_entry_lbl, best_entry = max(valid, key=lambda x: x[1])
+    else:
+        best_entry_lbl = "ATR pullback"
+        best_entry = round(price - 0.5*atr_v, 4)
+
+    # Entry R:R with this entry price
+    entry_rr = round((eff_target - best_entry) / max(best_entry - eff_stop, 0.0001), 2)
+
+    # If already at or below entry → buy now
+    if price <= best_entry * 1.005:
+        entry_note = f"Buy now — price at {best_entry_lbl}"
+    else:
+        dist_pct = (price - best_entry) / price * 100
+        entry_note = f"Wait for {best_entry_lbl} · {dist_pct:.2f}% below current"
+
     if qty > 0:
         # Existing position
         if "EXIT" in action:
             # Exit now at current price
-            est_pnl     = round((price - avg_cost) * qty, 2)
-            est_pnl_pct = round((price - avg_cost) / avg_cost * 100, 2) if avg_cost else 0
-            est_note    = "Exit at current price"
+            _gross      = (price - avg_cost) * qty
+            _buy_val    = avg_cost * qty
+            _sell_val   = price * qty
+            est_pnl     = net_pnl(_gross, _buy_val, _sell_val)
+            est_pnl_pct = round(est_pnl / _buy_val * 100, 2) if _buy_val else 0
+            est_note    = f"Exit at current price (after tx costs: HKD {round_trip_cost(_buy_val,_sell_val):,.0f})"
         elif "REDUCE" in action:
             # Reduce to half
-            est_pnl     = round((price - avg_cost) * qty * 0.5, 2)
-            est_pnl_pct = round((price - avg_cost) / avg_cost * 100, 2) if avg_cost else 0
-            est_note    = "Reduce 50% at current price"
+            _gross_r    = (price - avg_cost) * qty * 0.5
+            _buy_val_r  = avg_cost * qty * 0.5
+            _sell_val_r = price * qty * 0.5
+            est_pnl     = net_pnl(_gross_r, _buy_val_r, _sell_val_r)
+            est_pnl_pct = round(est_pnl / _buy_val_r * 100, 2) if _buy_val_r else 0
+            est_note    = f"Reduce 50% (after tx costs: HKD {round_trip_cost(_buy_val_r,_sell_val_r):,.0f})"
         elif "ADD" in action:
             # Add same size again, target = eff_target
             new_avg = (avg_cost * qty + price * qty) / (qty * 2)
-            est_pnl     = round((eff_target - new_avg) * qty * 2, 2)
-            est_pnl_pct = round((eff_target - new_avg) / new_avg * 100, 2) if new_avg else 0
-            est_note    = f"Add same size → target {eff_target:,.4f}"
+            _gross_a    = (eff_target - new_avg) * qty * 2
+            _buy_val_a  = price * qty           # new buy
+            _sell_val_a = eff_target * qty * 2  # sell all at target
+            est_pnl     = net_pnl(_gross_a, _buy_val_a, _sell_val_a)
+            est_pnl_pct = round(est_pnl / (new_avg * qty * 2) * 100, 2) if new_avg else 0
+            est_note    = f"Add same size → target {eff_target:,.4f} (after tx costs: HKD {round_trip_cost(_buy_val_a,_sell_val_a):,.0f})"
         else:
             # Hold to target, risking to stop
-            est_pnl_win  = round((eff_target - price) * qty, 2)
-            est_pnl_lose = round((eff_stop   - price) * qty, 2)
-            est_pnl      = est_pnl_win   # optimistic scenario
-            est_pnl_pct  = round((eff_target - price) / price * 100, 2) if price else 0
+            _buy_val_h   = avg_cost * qty
+            _sell_tgt    = eff_target * qty
+            _sell_stp    = eff_stop   * qty
+            _tc_win      = tx_cost(_sell_tgt, False)      # only sell cost (already bought)
+            _tc_lose     = tx_cost(_sell_stp, False)
+            est_pnl_win  = round((eff_target - price) * qty - _tc_win,  2)
+            est_pnl_lose = round((eff_stop   - price) * qty - _tc_lose, 2)
+            est_pnl      = est_pnl_win
+            est_pnl_pct  = round(est_pnl / _buy_val_h * 100, 2) if _buy_val_h else 0
             est_note     = (f"Hold: +{est_pnl_win:,.2f} to target / "
-                            f"{est_pnl_lose:,.2f} to stop")
+                            f"{est_pnl_lose:,.2f} to stop (tx costs incl.)")
     else:
         # Watchlist — new entry
         if "ENTER" in action or "ADD" in action:
-            entry_qty = 100  # placeholder — user sets actual size
-            est_pnl     = round((eff_target - price) * entry_qty, 2)
-            est_pnl_pct = round((eff_target - price) / price * 100, 2) if price else 0
-            est_note    = f"Entry × 100 units → target {eff_target:,.4f}"
+            entry_qty   = 100
+            _buy_val_e  = price * entry_qty
+            _sell_val_e = eff_target * entry_qty
+            _gross_e    = (eff_target - price) * entry_qty
+            est_pnl     = net_pnl(_gross_e, _buy_val_e, _sell_val_e)
+            est_pnl_pct = round(est_pnl / _buy_val_e * 100, 2) if _buy_val_e else 0
+            est_note    = f"Entry × 100 → target {eff_target:,.4f} (after tx: HKD {round_trip_cost(_buy_val_e,_sell_val_e):,.0f})"
         else:
             est_pnl = 0; est_pnl_pct = 0; est_note = "No action"
 
@@ -571,6 +922,25 @@ def analyse_position(ticker, name, avg_cost, qty, target, stop,
         "avg_cost":      avg_cost,
         "qty":           qty,
         "pnl":           round(pnl,2),
+        # Target recommendations
+        "intraday_target": intraday_target,
+        "intraday_stop":   intraday_stop,
+        "intraday_rr":     intraday_rr,
+        "intraday_pnl":    intraday_pnl,
+        "swing_target":    swing_target,
+        "swing_stop":      swing_stop,
+        "swing_rr":        swing_rr,
+        "swing_pnl":       swing_pnl,
+        "atr_v":           round(atr_v,4),
+        "range_left":      round(range_left,4),
+        "earn_eff":           round(earn_eff, 4),
+        "cycle":              cycle,
+        "intraday_suitable":  _intraday_suitable,
+        "swing_suitable":     _swing_suitable,
+        "intraday_reason":    _intraday_reason,
+        "swing_reason":       _swing_reason,
+        "chop_v":             round(chop_v,1),
+        "slope":              round(slope,4),
         "pnl_pct":       round(pnl_pct,2),
         "alloc":         round(alloc,1),
         "action":        action,
@@ -587,6 +957,10 @@ def analyse_position(ticker, name, avg_cost, qty, target, stop,
         "stop":          stop,
         "target":        target,
         "atr_stop":      atr_stop,
+        "best_entry":    best_entry,
+        "best_entry_lbl":best_entry_lbl,
+        "entry_rr":      entry_rr,
+        "entry_note":    entry_note,
         "atr_target":    atr_target,
         "stop_note":     stop_note,
         "stop_color":    stop_color,
@@ -724,6 +1098,15 @@ LOW: mixed signals — best to wait.
     total_invested=sum(p["qty"]*p["avg_cost"] for p in all_pos if p["qty"]>0)
 
     _init_forecast_db()
+
+    # Asset type filter — defined early so all sections can use it
+    ds_asset = st.radio(
+        "Instrument type",
+        ["📈 Stocks", "🌍 Forex & Commodities", "📊 All"],
+        horizontal=True, key="ds_asset",
+        help="Separate stocks from forex/commodities — different trading hours and liquidity")
+
+    _fmt = lambda v: f"{v:,.4f}" if v and v < 10 else f"{v:,.2f}" if v else "—"
     col_refresh,col_note=st.columns([1,3])
     if col_refresh.button("🔄 Refresh all",key="ds_refresh"):
         st.cache_data.clear(); st.rerun()
@@ -744,6 +1127,11 @@ LOW: mixed signals — best to wait.
             r["src"]=p["src"]
             results.append(r)
             time.sleep(0.15)
+
+    # Cache results in session state so Summary page can show Buy at prices
+    st.session_state["_ds_results_cache"] = {
+        r["ticker"]: r for r in results if not r.get("error")
+    }
 
     # Auto-save today's forecasts to DB
     today_str = now_hk.strftime("%Y-%m-%d")
@@ -822,23 +1210,31 @@ LOW: mixed signals — best to wait.
         tbl_ep=[]
         for r in sorted(valid, key=lambda x: -abs(x.get("est_pnl",0))):
             ep=r.get("est_pnl",0); er=r.get("est_risk",0)
+            be_v   = r.get("best_entry")
+            be_lbl = r.get("best_entry_lbl","")
+            be_rr  = r.get("entry_rr",0)
+            act_w  = r.get("action","")
+            _is_buy_act = any(w in act_w for w in ["ADD","ENTER","WAIT","WATCH"])
+            _fmt_be = (f"{be_v:,.4f}" if be_v and be_v<10 else f"{be_v:,.2f}" if be_v else "—")
             tbl_ep.append({
                 "Name":       r["name"],
                 "Ticker":     r["ticker"],
                 "Action":     r["action"].split()[0] + " " + r["action"].split()[1] if len(r["action"].split())>1 else r["action"],
+                "Buy at":     (_fmt_be if _is_buy_act else "—"),
+                "Entry basis":be_lbl if _is_buy_act and be_v else "—",
+                "Entry R:R":  f"1:{be_rr:.1f}" if _is_buy_act and be_rr>0 else "—",
                 "Current P&L":f"{'+'if r['pnl']>=0 else ''}{r['pnl']:,.2f}",
                 "Est. P&L":   f"{'+'if ep>=0 else ''}{ep:,.2f}",
-                "Est. P&L %": f"{'+'if r.get('est_pnl_pct',0)>=0 else ''}{r.get('est_pnl_pct',0):.2f}%",
-                "Est. Risk":  f"{er:,.2f}",
                 "R:R":        f"1:{r.get('est_rr',0):.1f}" if r.get('est_rr',0)>0 else "—",
-                "Scenario":   r.get("est_note","—"),
             })
         if tbl_ep:
             df_ep=pd.DataFrame(tbl_ep)
             def style_ep(df):
                 s=pd.DataFrame("",index=df.index,columns=df.columns)
                 for i,row in df.iterrows():
-                    for c in ["Current P&L","Est. P&L","Est. P&L %"]:
+                    if str(row.get("Buy at","—")) != "—":
+                        s.at[i,"Buy at"]="color:#2563eb;font-weight:700;font-size:0.95rem"
+                    for c in ["Current P&L","Est. P&L"]:
                         v=str(row.get(c,""))
                         if v.startswith("+"): s.at[i,c]="color:#16a34a;font-weight:600"
                         elif v.startswith("-"): s.at[i,c]="color:#dc2626;font-weight:600"
@@ -861,13 +1257,18 @@ LOW: mixed signals — best to wait.
         "<span style='color:#64748b;font-size:0.8rem'>"
         "Since you cycle capital daily — here is today's plan: "
         "what to sell (free capital) → what to buy (deploy capital) → "
-        "estimated available capital after rotation.</span>",
+        "estimated available capital after rotation. "
+        "Filtered to match the instrument type selected above.</span>",
         unsafe_allow_html=True)
 
     # Score every result for rotation priority
     rotation_rows = []
     for r in results:
         if r.get("error") or not r.get("price"): continue
+        # Apply same asset filter
+        _is_stk = r.get("src","stock") in ["stock","study"] or r.get("type","Stock") in ["Stock","Stock (HK)","Stock (US)"]
+        if ds_asset == "📈 Stocks" and not _is_stk: continue
+        if ds_asset == "🌍 Forex & Commodities" and _is_stk: continue
         price   = r["price"]
         qty     = r["qty"]
         avg_c   = r["avg_cost"]
@@ -876,10 +1277,14 @@ LOW: mixed signals — best to wait.
 
         # ── Component 1: Cycle ML score (% through cycle) ────────────
         # Use RSI + BB as proxy for cycle position if no cycle data
-        rsi_  = sig.get("rsi", 50)
-        bb_   = sig.get("bb_pct", 50)
-        # 0 = early cycle (trough), 100 = late cycle (peak)
-        cycle_pct = (rsi_/100*50 + bb_/100*50)  # blended 0-100
+        # Use multi-timeframe cycle if available, else fallback to RSI+BB
+        _cyc_r = r.get("cycle", {})
+        if _cyc_r and _cyc_r.get("combined",0) != 50:
+            cycle_pct = _cyc_r.get("combined", 50)
+        else:
+            rsi_  = sig.get("rsi", 50)
+            bb_   = sig.get("bb_pct", 50)
+            cycle_pct = (rsi_/100*50 + bb_/100*50)  # blended 0-100
 
         # ── Component 2: Technical signal score ──────────────────────
         # tech_score: positive = bullish, negative = bearish
@@ -906,22 +1311,32 @@ LOW: mixed signals — best to wait.
         else:
             stp_score = 50
 
+        # ── Earning efficiency boost ──────────────────────────────────
+        # High earn_eff = oscillating, good range, good win_rate
+        # Scale 0–1: earn_eff 0.5+ = top performer, 0.1 = low quality
+        ee_r    = r.get("earn_eff", 0) or 0
+        ee_mult = min(ee_r / 0.3, 1.5)  # normalise: 0.3 = baseline, cap at 1.5×
+
         # ── Combined rotation score ───────────────────────────────────
-        # SELL score (0-100): high = should sell today to free capital
-        # Weights: cycle position 35% + tech reversal signal 35% + near target 30%
         sell_score = round(
-            cycle_pct       * 0.35 +
-            (100-tech_norm) * 0.35 +   # bearish tech = sell signal
-            tgt_score       * 0.30,
+            (cycle_pct       * 0.35 +
+             (100-tech_norm) * 0.35 +
+             tgt_score       * 0.30),
             1)
 
-        # BUY score (0-100): high = should buy today
-        # Weights: early cycle 35% + bullish tech 35% + far from stop (safety) 30%
+        # Buy score boosted by earn_eff — better oscillators surface higher
         buy_score = round(
-            (100-cycle_pct) * 0.35 +
-            tech_norm       * 0.35 +
-            stp_score       * 0.30,
+            ((100-cycle_pct) * 0.35 +
+             tech_norm       * 0.35 +
+             stp_score       * 0.30) * ee_mult,
             1)
+        # Boost buy_score if multi-cycle says BUY, reduce if SELL
+        _bias = r.get("cycle",{}).get("action_bias","NEUTRAL")
+        if "STRONG BUY" in _bias:   buy_score = min(buy_score * 1.25, 100)
+        elif "BUY" in _bias:        buy_score = min(buy_score * 1.10, 100)
+        elif "STRONG SELL" in _bias:buy_score = max(buy_score * 0.60, 0)
+        elif "SELL" in _bias:       buy_score = max(buy_score * 0.80, 0)
+        buy_score = min(buy_score, 100)
 
         # Net rotation: positive = BUY bias, negative = SELL bias
         net_score = round(buy_score - sell_score, 1)
@@ -945,6 +1360,7 @@ LOW: mixed signals — best to wait.
             "freed":       round(freed, 0),
             "action":      r.get("action", "—"),
             "status":      r.get("status", "OPEN"),
+            "earn_eff":    round(ee_r, 4),
         })
 
     if not rotation_rows:
@@ -1068,8 +1484,13 @@ LOW: mixed signals — best to wait.
                     f"<div style='font-size:0.9rem;font-weight:700'>{price_s}</div>"
                     f"<div style='font-size:0.78rem;color:#16a34a;font-weight:600'>"
                     f"Deploy: HKD {alloc_hkd:,.0f} ({alloc_pct:.0f}%)</div>"
+                    f"<div style='font-size:0.82rem;font-weight:700;color:#2563eb'>"
+                    f"Buy at: {_fmt(r.get('best_entry'))} "
+                    f"<span style='font-size:0.72rem;font-weight:400;color:#64748b'>"
+                    f"({r.get('best_entry_lbl','ATR pullback')})</span></div>"
                     f"<div style='font-size:0.72rem;color:#64748b'>"
-                    f"~{shares_sug:,} shares · Buy score: {r['buy_score']:.0f}/100</div>"
+                    f"~{shares_sug:,} shares · Buy score: {r['buy_score']:.0f}/100 · "
+                    f"Earn Eff: {r.get('earn_eff',0):.3f}</div>"
                     f"</div></div>",
                     unsafe_allow_html=True)
         else:
@@ -1089,6 +1510,7 @@ LOW: mixed signals — best to wait.
                 "Cycle %":    f"{r['cycle_pct']:.0f}%",
                 "Tech":       f"{r['tech_norm']:.0f}",
                 "Tgt prox":   f"{r['tgt_score']:.0f}",
+                "Earn Eff":   f"{r.get('earn_eff',0):.3f}",
                 "Current P&L":f"{'+'if r['pnl']>=0 else ''}{r['pnl']:,.0f}" if r["qty"]>0 else "—",
             } for r in sorted(rotation_rows, key=lambda x:-x["sell_score"])])
 
@@ -1139,7 +1561,15 @@ LOW: mixed signals — best to wait.
          "👁 Watchlist only","⚡ High confidence only"],
         key="ds_filter")
 
+    _STOCK_SRC = ["stock"]  # src field set in all_pos
+
     def should_show(r):
+        # Asset type filter
+        src_ = r.get("src","stock")
+        is_stock = src_ in ["stock","study"] or r.get("type","Stock") in ["Stock","Stock (HK)","Stock (US)"]
+        if ds_asset == "📈 Stocks" and not is_stock: return False
+        if ds_asset == "🌍 Forex & Commodities" and is_stock: return False
+
         s=filter_opt
         if s=="All positions": return True
         if s=="🔴 Action needed (Exit/Reduce/Add)":
@@ -1296,6 +1726,65 @@ LOW: mixed signals — best to wait.
                             f"<div style='font-size:0.68rem;color:#64748b'>{note}</div>"
                             f"</div>",unsafe_allow_html=True)
 
+            # ── Multi-timeframe cycle display ─────────────────────
+            cyc = r.get("cycle", {})
+            if cyc:
+                mac_p = cyc.get("macro_pct",50); mac_l = cyc.get("macro_label","—")
+                mes_p = cyc.get("meso_pct",50);  mes_l = cyc.get("meso_label","—")
+                mic_p = cyc.get("micro_pct",50); mic_l = cyc.get("micro_label","—")
+                com_p = cyc.get("combined",50);  dom   = cyc.get("dominant","meso")
+                bias  = cyc.get("action_bias","NEUTRAL")
+                conf  = cyc.get("conflict",False)
+                conf_n= cyc.get("conflict_note","")
+                bias_c= ("#16a34a" if "BUY" in bias else "#dc2626" if "SELL" in bias else "#f59e0b")
+
+                def _bar(pct, w=80):
+                    filled = int(pct/100*w)
+                    c = "#16a34a" if pct<35 else "#f59e0b" if pct<65 else "#dc2626"
+                    return (f"<span style='display:inline-block;width:{filled}px;height:6px;"
+                            f"background:{c};border-radius:3px'></span>"
+                            f"<span style='display:inline-block;width:{w-filled}px;height:6px;"
+                            f"background:#e2e8f0;border-radius:3px'></span>")
+
+                st.markdown(
+                    f"<div style='border:1px solid #e2e8f0;border-radius:9px;"
+                    f"padding:10px 14px;background:#f8fafc;margin-bottom:8px'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                    f"margin-bottom:6px'>"
+                    f"<span style='font-size:0.72rem;font-weight:600;color:#64748b'>🔄 CYCLE POSITION</span>"
+                    f"<span style='font-size:0.8rem;font-weight:700;color:{bias_c}'>{bias} ({com_p:.0f}%)</span>"
+                    f"</div>"
+                    f"<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px'>"
+                    # Macro
+                    f"<div>"
+                    f"<div style='font-size:0.65rem;color:#94a3b8'>Macro (1-3mo)</div>"
+                    f"<div style='font-size:0.8rem;font-weight:600'>{mac_l} {mac_p:.0f}%</div>"
+                    f"{_bar(mac_p)}"
+                    f"<div style='font-size:0.65rem;color:#64748b;margin-top:2px'>"
+                    f"{cyc.get('macro_signal','')[:35]}</div>"
+                    f"</div>"
+                    # Meso
+                    f"<div style='border-left:2px solid {'#2563eb' if dom=='meso' else '#e2e8f0'};padding-left:8px'>"
+                    f"<div style='font-size:0.65rem;color:{'#2563eb' if dom=='meso' else '#94a3b8'}'>Meso (1-3wk) {'★' if dom=='meso' else ''}</div>"
+                    f"<div style='font-size:0.8rem;font-weight:600'>{mes_l} {mes_p:.0f}%</div>"
+                    f"{_bar(mes_p)}"
+                    f"<div style='font-size:0.65rem;color:#64748b;margin-top:2px'>"
+                    f"{cyc.get('meso_signal','')[:35]}</div>"
+                    f"</div>"
+                    # Micro
+                    f"<div>"
+                    f"<div style='font-size:0.65rem;color:#94a3b8'>Micro (1-3d)</div>"
+                    f"<div style='font-size:0.8rem;font-weight:600'>{mic_l} {mic_p:.0f}%</div>"
+                    f"{_bar(mic_p)}"
+                    f"<div style='font-size:0.65rem;color:#64748b;margin-top:2px'>"
+                    f"{cyc.get('micro_signal','')[:35]}</div>"
+                    f"</div>"
+                    f"</div>"
+                    + (f"<div style='margin-top:6px;font-size:0.72rem;color:#f59e0b;"
+                       f"border-top:1px solid #fde68a;padding-top:4px'>⚠️ Cycle conflict: {conf_n}</div>"
+                       if conf else "")
+                    + f"</div>", unsafe_allow_html=True)
+
             # Money flow context strip
             flow_s = r.get("flow_score",0)
             if flow_s != 0 or r.get("flow_sector","—") != "—":
@@ -1311,6 +1800,121 @@ LOW: mixed signals — best to wait.
                     f"{r.get('flow_driver','—')} · "
                     f"{sig_.get('flow_note','')}</span></div>",
                     unsafe_allow_html=True)
+
+            # ── Suggested entry price ────────────────────────────
+            be   = r.get("best_entry")
+            be_l = r.get("best_entry_lbl","—")
+            be_n = r.get("entry_note","—")
+            be_rr= r.get("entry_rr",0)
+            act_ = r.get("action","")
+            if be and any(w in act_ for w in ["ADD","ENTER","WAIT","WATCH"]):
+                price_s2 = r.get("price",0)
+                at_entry = price_s2 <= be * 1.005 if price_s2 and be else False
+                be_c     = "#16a34a" if at_entry else "#2563eb"
+                be_bg    = "rgba(22,163,74,0.05)" if at_entry else "rgba(37,99,235,0.03)"
+                be_border= "#86efac" if at_entry else "#bfdbfe"
+                rr_c_be  = "#16a34a" if be_rr>=2 else "#f59e0b" if be_rr>=1 else "#dc2626"
+                fmt_be   = f"{be:,.4f}" if be < 10 else f"{be:,.2f}"
+                st.markdown(
+                    f"<div style='border:1px solid {be_border};border-radius:9px;"
+                    f"padding:10px 14px;background:{be_bg};margin-bottom:8px'>"
+                    f"<div style='font-size:0.7rem;font-weight:600;color:{be_c}'>"
+                    f"{'🟢 BUY NOW' if at_entry else '📍 SUGGESTED ENTRY PRICE'}</div>"
+                    f"<div style='display:flex;gap:20px;align-items:center;margin-top:5px'>"
+                    f"<div>"
+                    f"<span style='font-size:1.0rem;font-weight:700;color:{be_c}'>{fmt_be}</span>"
+                    f"<span style='font-size:0.78rem;color:#64748b;margin-left:6px'>"
+                    f"({be_l})</span>"
+                    f"</div>"
+                    f"<div style='font-size:0.78rem'>"
+                    f"R:R if filled: <b style='color:{rr_c_be}'>1:{be_rr:.1f}</b>"
+                    f"</div></div>"
+                    f"<div style='font-size:0.72rem;color:#64748b;margin-top:3px'>"
+                    f"{be_n}</div>"
+                    f"</div>", unsafe_allow_html=True)
+
+            # ── Target recommendations ───────────────────────────
+            itgt = r.get("intraday_target"); istop = r.get("intraday_stop")
+            stgt = r.get("swing_target");    sstop = r.get("swing_stop")
+            irr  = r.get("intraday_rr",0);   srr   = r.get("swing_rr",0)
+            ipnl = r.get("intraday_pnl",0);  spnl  = r.get("swing_pnl",0)
+            atr_ = r.get("atr_v",0)
+
+            if itgt and stgt:
+                tc1,tc2 = st.columns(2)
+                price_s = r.get("price",0)
+                _i_ok = r.get("intraday_suitable", True)
+                _s_ok = r.get("swing_suitable", True)
+                _i_why = r.get("intraday_reason","")
+                _s_why = r.get("swing_reason","")
+                # Intraday
+                irr_c = "#16a34a" if irr>=1.5 else "#f59e0b" if irr>=1.0 else "#dc2626"
+                if not _i_ok:
+                    tc1.markdown(
+                        f"<div style='border:1px solid #e2e8f0;border-radius:9px;"
+                        f"padding:10px 14px;background:#f8fafc'>"
+                        f"<div style='font-size:0.7rem;font-weight:600;color:#94a3b8'>"
+                        f"⚡ INTRADAY TARGET</div>"
+                        f"<div style='font-size:0.78rem;color:#dc2626;margin-top:4px'>"
+                        f"⛔ Not recommended</div>"
+                        f"<div style='font-size:0.72rem;color:#94a3b8;margin-top:2px'>"
+                        f"{_i_why}</div></div>", unsafe_allow_html=True)
+                else:
+                    tc1.markdown(
+                    f"<div style='border:1px solid #bfdbfe;border-radius:9px;"
+                    f"padding:10px 14px;background:rgba(37,99,235,0.03)'>"
+                    f"<div style='font-size:0.7rem;font-weight:600;color:#2563eb'>"
+                    f"⚡ INTRADAY TARGET (today)</div>"
+                    f"<div style='display:flex;justify-content:space-between;margin-top:4px'>"
+                    f"<span style='font-size:0.82rem'>"
+                    f"🎯 <b>{_fmt(itgt)}</b> "
+                    f"<span style='color:#16a34a'>({(itgt-price_s)/price_s*100:+.2f}%)</span>"
+                    f"</span>"
+                    f"<span style='font-size:0.82rem'>"
+                    f"🛑 <b>{_fmt(istop)}</b> "
+                    f"<span style='color:#dc2626'>({(istop-price_s)/price_s*100:+.2f}%)</span>"
+                    f"</span></div>"
+                    f"<div style='margin-top:4px;font-size:0.78rem'>"
+                    f"R:R <b style='color:{irr_c}'>1:{irr:.1f}</b> · "
+                    f"Est: <b>{'+'if ipnl>=0 else ''}{ipnl:,.0f}</b> · "
+                    f"ATR: {_fmt(atr_)}</div>"
+                    f"<div style='font-size:0.68rem;color:#64748b;margin-top:2px'>"
+                    f"Based on 65% of remaining daily range · Exit same day</div>"
+                    f"</div>", unsafe_allow_html=True)
+                # Swing
+                srr_c = "#16a34a" if srr>=2.0 else "#f59e0b" if srr>=1.2 else "#dc2626"
+                if not _s_ok:
+                    tc2.markdown(
+                        f"<div style='border:1px solid #e2e8f0;border-radius:9px;"
+                        f"padding:10px 14px;background:#f8fafc'>"
+                        f"<div style='font-size:0.7rem;font-weight:600;color:#94a3b8'>"
+                        f"📅 SWING TARGET (2-3 days)</div>"
+                        f"<div style='font-size:0.78rem;color:#dc2626;margin-top:4px'>"
+                        f"⛔ Not recommended</div>"
+                        f"<div style='font-size:0.72rem;color:#94a3b8;margin-top:2px'>"
+                        f"{_s_why}</div></div>", unsafe_allow_html=True)
+                else:
+                    tc2.markdown(
+                    f"<div style='border:1px solid #bbf7d0;border-radius:9px;"
+                    f"padding:10px 14px;background:rgba(22,163,74,0.03)'>"
+                    f"<div style='font-size:0.7rem;font-weight:600;color:#16a34a'>"
+                    f"📅 SWING TARGET (2-3 days)</div>"
+                    f"<div style='display:flex;justify-content:space-between;margin-top:4px'>"
+                    f"<span style='font-size:0.82rem'>"
+                    f"🎯 <b>{_fmt(stgt)}</b> "
+                    f"<span style='color:#16a34a'>({(stgt-price_s)/price_s*100:+.2f}%)</span>"
+                    f"</span>"
+                    f"<span style='font-size:0.82rem'>"
+                    f"🛑 <b>{_fmt(sstop)}</b> "
+                    f"<span style='color:#dc2626'>({(sstop-price_s)/price_s*100:+.2f}%)</span>"
+                    f"</span></div>"
+                    f"<div style='margin-top:4px;font-size:0.78rem'>"
+                    f"R:R <b style='color:{srr_c}'>1:{srr:.1f}</b> · "
+                    f"Est: <b>{'+'if spnl>=0 else ''}{spnl:,.0f}</b> · "
+                    f"2.5×ATR×chop</div>"
+                    f"<div style='font-size:0.68rem;color:#64748b;margin-top:2px'>"
+                    f"Based on 2-3 day cycle amplitude · Exit before full cycle</div>"
+                    f"</div>", unsafe_allow_html=True)
 
             # Quick update stop/target
             with st.expander("✏️ Update stop / target"):

@@ -246,6 +246,7 @@ def indicator_fig(df, title=""):
 def render(chart_interval="5m", daily_period="3mo"):
     import strategy_page as _sp
     import cycle_ml as _cm
+    import fundamentals as _fund
 
     st.markdown(
         "## 🔬 Analysis &amp; Strategy",
@@ -259,6 +260,7 @@ def render(chart_interval="5m", daily_period="3mo"):
         "📊 Technical Analysis",
         "🧠 Market Study",
         "🔄 Cycle ML",
+        "📈 Fundamentals",
     ])
 
     with master_tabs[0]:
@@ -269,6 +271,9 @@ def render(chart_interval="5m", daily_period="3mo"):
 
     with master_tabs[2]:
         _cm.render()
+
+    with master_tabs[3]:
+        _fund.render_fundamentals_page()
 
 
 def _render_analysis(chart_interval="5m", daily_period="3mo"):

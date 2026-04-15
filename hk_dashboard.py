@@ -28,6 +28,10 @@ import portfolio_study
 import daily_strategy
 import money_flow
 import risk_tools
+try:
+    import fundamentals as _fund
+except Exception:
+    _fund = None
 
 # ── INIT ──────────────────────────────────────────────────────────────
 init_db()
@@ -64,6 +68,16 @@ st.markdown("""
 
 HK_TZ = pytz.timezone("Asia/Hong_Kong")
 
+# ── TRANSACTION COSTS ─────────────────────────────────────────────────
+_COMM_RATE = 0.00028; _COMM_MIN = 28; _STAMP = 0.001
+
+def _tx(value, is_buy=True):
+    return round(max(value*_COMM_RATE, _COMM_MIN) + (value*_STAMP if is_buy else 0), 2)
+
+def _net(gross, buy_val, sell_val):
+    return round(gross - _tx(buy_val, True) - _tx(sell_val, False), 2)
+
+
 # ── TICKER HELPERS ────────────────────────────────────────────────────
 def _variants(ticker):
     v=[ticker]; code=ticker.replace(".HK","")
@@ -95,8 +109,7 @@ with st.sidebar:
         "💰  Flow",
         "📋  Portfolio",
         "🔬  Analysis",
-        "🔍  Scanner",
-        "📐  Study",
+        "🔎  Opportunities",
         "🛡  Risk",
     ], key="nav_page", label_visibility="collapsed")
 
@@ -305,15 +318,23 @@ def render_summary():
             tgt=r.get("target"); stp=r.get("stop"); price=r["price"]
             tgt_d=(tgt-price)/price*100 if tgt and price else None
             stp_d=(stp-price)/price*100 if stp and price else None
+            # Get buy price from daily session cache if available
+            _ds_cache = st.session_state.get("_ds_results_cache", {})
+            _be_val   = _ds_cache.get(r["ticker"], {}).get("best_entry")
+            _be_act   = _ds_cache.get(r["ticker"], {}).get("action","")
+            _be_lbl   = _ds_cache.get(r["ticker"], {}).get("best_entry_lbl","")
+            _show_buy = _be_val and any(w in _be_act for w in ["ADD","ENTER","WAIT","WATCH"])
+            _buy_str  = (fmt_price(_be_val) if _show_buy else "—")
+
             tbl_data.append({
                 "Type":    r["type"],
                 "Name":    r["name"],
                 "Ticker":  r["ticker"],
                 "Price":   fmt_price(price),
+                "Buy at":  _buy_str,
                 "Day %":   fpct(dp),
                 "P&L":     fp(pnl) if pnl is not None else "—",
                 "Return %":fpct(pnlp),
-                "Cost":    f"{cb:,.0f}",
                 "Alloc %": f"{pos_pct:.1f}%",
                 "Target":  f"{tgt:,.4f} ({tgt_d:+.1f}%)" if tgt and tgt_d is not None else "—",
                 "Stop":    f"{stp:,.4f} ({stp_d:+.1f}%)" if stp and stp_d is not None else "—",
@@ -324,18 +345,50 @@ def render_summary():
         # colour P&L and Return % columns
         def style_table(df):
             styles=pd.DataFrame("",index=df.index,columns=df.columns)
-            for col in ["P&L","Return %","Day %"]:
-                if col in df.columns:
-                    for i,v in enumerate(df[col]):
-                        if isinstance(v,str) and v.startswith("+"):
-                            styles.iloc[i][col]="color:#16a34a;font-weight:600"
-                        elif isinstance(v,str) and v.startswith("-"):
-                            styles.iloc[i][col]="color:#dc2626;font-weight:600"
+            for i,row in df.iterrows():
+                for col in ["P&L","Return %","Day %"]:
+                    if col in df.columns:
+                        v=str(row.get(col,""))
+                        if v.startswith("+"): styles.at[i,col]="color:#16a34a;font-weight:600"
+                        elif v.startswith("-"): styles.at[i,col]="color:#dc2626;font-weight:600"
+                if "Buy at" in df.columns and str(row.get("Buy at","—")) != "—":
+                    styles.at[i,"Buy at"]="color:#2563eb;font-weight:700;font-size:0.95rem"
             return styles
 
         st.dataframe(
             df_tbl.style.apply(style_table,axis=None),
             use_container_width=True, hide_index=True)
+
+    # Transaction cost note
+    if pnl_rows:
+        total_sell_val = sum(r["val"] for r in pnl_rows if r["val"])
+        total_buy_val  = sum(r["cost"] for r in pnl_rows if r["cost"])
+        exit_tx = sum(_tx(r["val"] or 0, False) for r in pnl_rows if r["val"])
+        st.markdown(
+            f"<div style='background:#fefce8;border:1px solid #fde68a;"
+            f"border-radius:8px;padding:8px 14px;font-size:0.79rem;margin-bottom:8px'>"
+            f"💰 <b>Transaction costs if you exit all positions today:</b> "
+            f"HKD {exit_tx:,.0f} "
+            f"(0.028% commission min HKD 28 + 0.1% stamp on buys) · "
+            f"Net P&L after costs: "
+            f"<b>{'+'if (total_pnl-exit_tx)>=0 else ''}{total_pnl-exit_tx:,.0f}</b></div>",
+            unsafe_allow_html=True)
+
+    # ── Fundamental triggers ─────────────────────────────────────────
+    if _fund is not None:
+        try:
+            _stock_tickers = {
+                r["ticker"]: r.get("name", r["ticker"])
+                for r in pnl_rows
+                if not str(r["ticker"]).endswith("=X")
+                and not str(r["ticker"]).endswith("=F")
+                and not str(r["ticker"]).startswith("BTC")
+                and not str(r["ticker"]).startswith("ETH")
+            } if pnl_rows else {}
+            if _stock_tickers:
+                _fund.render_summary_triggers(_stock_tickers)
+        except Exception:
+            pass
 
     st.markdown("---")
 
@@ -387,12 +440,17 @@ def render_summary():
                     sharpe_like=ret_pct/ann_vol if ann_vol>0 else 0
 
                     # Range capture ratio:
-                    # Your actual return % vs the total range% the stock offered
                     total_range_offered=float(ranges.sum()/df_h["Close"].iloc[0]*100)
                     range_capture=ret_pct/total_range_offered*100 if total_range_offered>0 else 0
 
-                    # Win rate (% of days position gained)
+                    # Win rate
                     win_rate=float((rets>0).mean()*100)
+
+                    # Earning efficiency — price-normalised, core metric
+                    # avg_daily_range% × chop_factor × win_rate / volatility
+                    chop_pre = _choppiness(df_h) or 50
+                    chop_f_pre = max((chop_pre-38)/(61.8-38), 0)
+                    earn_eff_s = (avg_range_pct * chop_f_pre * (win_rate/100)) / (ann_vol/100+0.01)
 
                     # R:R quality
                     tgt=r.get("target"); stp=r.get("stop"); price=r["price"]
@@ -464,6 +522,7 @@ def render_summary():
                         "type":       r["type"],
                         "ret_pct":    round(ret_pct,2),
                         "ann_vol":    round(ann_vol,1),
+                        "earn_eff":   round(earn_eff_s,4),
                         "sharpe":     round(sharpe_like,3),
                         "avg_range":  round(avg_range,1),
                         "avg_range_pct": round(avg_range_pct,2),
@@ -500,17 +559,19 @@ def render_summary():
                 def _f(v, fmt, suffix="", fallback="—"):
                     try: return format(v, fmt) + suffix if v is not None else fallback
                     except: return fallback
+                ee_v = s.get("earn_eff",0) or 0
+                ee_flag = "✅" if ee_v>0.3 else ("⚠️" if ee_v<0.1 else "")
                 eff_data.append({
                     "Name":          s["name"],
                     "Type":          s["type"],
+                    "Earn Eff ▲":    f"{ee_v:.3f} {ee_flag}".strip(),
                     "Return %":      _f(s['ret_pct'],  '+.2f', '%'),
                     "Ann. Vol %":    _f(s['ann_vol'],  '.1f',  '%'),
-                    "Sharpe-like":   (_f(s['sharpe'], '+.3f') + f" {sharpe_flag}").strip(),
-                    "Avg range HKD": _f(s['avg_range'],     '.1f'),
                     "Avg range %":   _f(s['avg_range_pct'], '.2f', '%'),
-                    "Max drawdown":  (_f(s['max_dd'], '.1f', '%') + f" {dd_flag}").strip(),
                     "Win rate":      _f(s['win_rate'],      '.0f', '%'),
                     "Range capture": _f(s['range_capture'], '+.2f', '%'),
+                    "Max drawdown":  (_f(s['max_dd'], '.1f', '%') + f" {dd_flag}").strip(),
+                    "Sharpe-like":   (_f(s['sharpe'], '+.3f') + f" {sharpe_flag}").strip(),
                     "Alloc %":       _f(s['alloc'],         '.1f', '%'),
                     "R:R":           f"1:{s['rr']:.1f}" if s["rr"] else "—",
                 })
@@ -520,9 +581,16 @@ def render_summary():
             def style_eff(df):
                 styles=pd.DataFrame("",index=df.index,columns=df.columns)
                 for i,row in df.iterrows():
+                    # Earn Eff — primary sort column
+                    try:
+                        ee=float(str(row["Earn Eff ▲"]).split()[0])
+                        if ee>=0.3:   styles.at[i,"Earn Eff ▲"]="color:#16a34a;font-weight:700"
+                        elif ee>=0.1: styles.at[i,"Earn Eff ▲"]="color:#f59e0b;font-weight:600"
+                        else:         styles.at[i,"Earn Eff ▲"]="color:#dc2626"
+                    except: pass
                     for col in ["Return %","Sharpe-like","Range capture"]:
-                        v=str(row[col])
-                        if v.startswith("+") or (v[0].isdigit() and "⚠️" not in v):
+                        v=str(row.get(col,""))
+                        if v.startswith("+") or (len(v)>0 and v[0].isdigit() and "⚠️" not in v):
                             styles.at[i,col]="color:#16a34a;font-weight:600"
                         elif v.startswith("-") or "⚠️" in v:
                             styles.at[i,col]="color:#dc2626;font-weight:600"
@@ -821,7 +889,12 @@ def _build_alloc_rows(capital):
                         chop   = _choppiness(df_h) or 50
                         ranges = df_h["High"]-df_h["Low"]
                         avg_r  = float(ranges.mean())
+                        price_now_ = float(df_h["Close"].iloc[-1])
+                        avg_r_pct  = avg_r/price_now_*100 if price_now_>0 else 0
                         wr     = float((rets>0).mean()*100)
+                        # earn_eff: range%_per_day × chop_factor × win_rate / volatility
+                        chop_f   = max((chop-38)/(61.8-38), 0)
+                        earn_eff = (avg_r_pct * chop_f * (wr/100)) / (vol/100+0.01)
                         # trend score
                         closes = df_h["Close"]
                         x_     = np.arange(len(closes))
@@ -836,6 +909,7 @@ def _build_alloc_rows(capital):
                         ts = min(ts,100)
                     else:
                         vol=30; ret_=0; sharpe=0; chop=50; avg_r=0; wr=50; ts=0
+                        avg_r_pct=0; earn_eff=0
                     _time.sleep(0.15)
                 except Exception:
                     vol=30; ret_=0; sharpe=0; chop=50; avg_r=0; wr=50; ts=0
@@ -873,6 +947,8 @@ def _build_alloc_rows(capital):
                     "cost":        cb,
                     "alloc":       round(alloc_pct,1),
                     "sharpe":      round(sharpe,3),
+                    "earn_eff":    round(earn_eff,4),
+                    "avg_range_pct": round(avg_r_pct,3),
                     "chop":        round(chop,1),
                     "chop_now":    round(chop,1),
                     "avg_range":   round(avg_r,1),
@@ -910,7 +986,11 @@ def _build_alloc_rows(capital):
                         chop   = _choppiness(df_h) or 50
                         ranges = df_h["High"]-df_h["Low"]
                         avg_r  = float(ranges.mean())
+                        price_now_ = float(df_h["Close"].iloc[-1])
+                        avg_r_pct  = avg_r/price_now_*100 if price_now_>0 else 0
                         wr     = float((rets>0).mean()*100)
+                        chop_f   = max((chop-38)/(61.8-38), 0)
+                        earn_eff = (avg_r_pct * chop_f * (wr/100)) / (vol/100+0.01)
                         closes = df_h["Close"]
                         x_     = np.arange(len(closes))
                         slope_ = float(np.polyfit(x_,closes.values,1)[0])/float(closes.mean())*100
@@ -921,6 +1001,7 @@ def _build_alloc_rows(capital):
                         ts = min(ts,100)
                     else:
                         vol=20; ret_=0; sharpe=0; chop=50; avg_r=0; wr=50; ts=0
+                        avg_r_pct=0; earn_eff=0
                     _time.sleep(0.15)
                 except Exception:
                     vol=20; ret_=0; sharpe=0; chop=50; avg_r=0; wr=50; ts=0
@@ -952,6 +1033,8 @@ def _build_alloc_rows(capital):
                     "cost":        cb,
                     "alloc":       round(alloc_pct,1),
                     "sharpe":      round(sharpe,3),
+                    "earn_eff":    round(earn_eff,4),
+                    "avg_range_pct": round(avg_r_pct,4),
                     "chop":        round(chop,1),
                     "chop_now":    round(chop,1),
                     "avg_range":   round(avg_r,4),
@@ -1051,14 +1134,18 @@ Instruments where you have a statistical edge get more capital.
         """)
 
     # Controls
-    fc1,fc2,fc3,fc4 = st.columns(4)
+    fc1,fc2,fc3,fc4,fc5 = st.columns(5)
     max_single   = fc1.slider("Max per position %", 10, 60, 35, 5, key="sa_max")
     cash_reserve = fc2.slider("Min cash reserve %",  0, 50, 15, 5, key="sa_cash")
     min_pos      = fc3.slider("Min position size %", 1, 15,  5, 1, key="sa_min")
-    include      = fc4.multiselect("Include",
+    include      = fc4.multiselect("Include status",
                                     ["OPEN","WATCH"],
                                     default=["OPEN","WATCH"],
                                     key="sa_include")
+    asset_filter = fc5.selectbox("Asset type",
+                                  ["Stocks only", "Forex & Commodities only", "All combined"],
+                                  index=0, key="sa_asset",
+                                  help="Stocks and Forex/Commodities have different trading hours and liquidity — optimise separately to avoid cross-contamination")
 
     if st.button("🔄 Load & Optimise", key="sa_run", type="primary"):
         with st.spinner("Loading portfolio data and computing metrics…"):
@@ -1072,9 +1159,28 @@ Instruments where you have a statistical edge get more capital.
 
     # Filter by status
     rows = [r for r in rows if r.get("status","OPEN") in include]
+
+    # Asset type filter
+    STOCK_TYPES = ["Stock","Stock (HK)","Stock (US)"]
+    if asset_filter == "Stocks only":
+        rows = [r for r in rows if r.get("type","Stock") in STOCK_TYPES]
+        _asset_label = "📈 Stocks (HKEX/US)"
+    elif asset_filter == "Forex & Commodities only":
+        rows = [r for r in rows if r.get("type","Stock") not in STOCK_TYPES]
+        _asset_label = "🌍 Forex & Commodities"
+    else:
+        _asset_label = "📊 All instruments"
+
     if not rows:
-        st.warning("No items match the selected status filter.")
+        st.info(f"No positions match the selected filters.")
         return
+
+    st.markdown(
+        f"<div style='background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;"
+        f"padding:8px 14px;font-size:0.8rem;margin-bottom:8px'>"
+        f"Optimising: <b>{_asset_label}</b> · {len(rows)} positions · "
+        f"Capital to deploy: HKD {capital*(1-cash_reserve/100):,.0f}</div>",
+        unsafe_allow_html=True)
 
     deployable = capital * (1 - cash_reserve/100)
 
@@ -1102,6 +1208,20 @@ Instruments where you have a statistical edge get more capital.
 
     st.markdown("<br>",unsafe_allow_html=True)
     st.markdown("**Allocation comparison table**")
+
+    # Load today's daily signals for alignment check
+    _daily_signals = {}
+    try:
+        from daily_strategy import get_forecast_history as _gfh
+        import datetime as _dt
+        _today = _dt.datetime.now(pytz.timezone("Asia/Hong_Kong")).strftime("%Y-%m-%d")
+        _fc = _gfh(1)
+        if not _fc.empty:
+            for _,_fr in _fc[_fc["date"]==_today].iterrows():
+                _action = str(_fr.get("action","—"))
+                _daily_signals[_fr["ticker"]] = _action
+    except Exception:
+        pass
 
     tbl = []
     for t,s in by_ticker.items():
@@ -1161,6 +1281,7 @@ Instruments where you have a statistical edge get more capital.
             "Range opp":  f"{ra_p:.1f}%" if ra_p>0 else "—",
             "Momentum":   f"{mo_p:.1f}%" if mo_p>0 else "—",
             "Cycle adj":  f"{cy_p:.1f}%" if cy_p>0 else "—",
+            "Earn Eff":   f"{s.get('earn_eff',0):.3f}",
             "Votes":      f"{votes}/5",
             "Consensus %":f"{consensus:.1f}%" if consensus>0 else "—",
             "HKD":        f"HKD {hkd_c:,.0f}" if consensus>0 else "—",
@@ -1169,6 +1290,21 @@ Instruments where you have a statistical edge get more capital.
             "_consensus": consensus,
             "_ac":        ac_,
         })
+        # Add daily alignment check
+        _ds = _daily_signals.get(t, "")
+        if _ds:
+            _sell_sig = any(w in _ds.upper() for w in ["EXIT","REDUCE"])
+            _buy_sig  = any(w in _ds.upper() for w in ["ADD","ENTER"])
+            _aligned  = (
+                ("✅ Agree" if (consensus > cur+5 and _buy_sig) or
+                               (consensus < cur-5 and _sell_sig) or
+                               (abs(consensus-cur) <= 5)
+                 else "⚠️ Conflict"))
+            tbl[-1]["Daily signal"] = _ds.split("·")[0].strip()[:20]
+            tbl[-1]["Alignment"]    = _aligned
+        else:
+            tbl[-1]["Daily signal"] = "—"
+            tbl[-1]["Alignment"]    = "—"
 
     tbl.sort(key=lambda x: -x["_consensus"])
     df_clean = pd.DataFrame([{k:v for k,v in r.items() if not k.startswith("_")} for r in tbl])
@@ -1192,10 +1328,43 @@ Instruments where you have a statistical edge get more capital.
             rot=str(row.get("Rotation",""))
             if rot.startswith("🟢"): s.at[i,"Rotation"]="color:#16a34a;font-weight:600"
             elif rot.startswith("🔴"): s.at[i,"Rotation"]="color:#dc2626;font-weight:600"
+            aln=str(row.get("Alignment",""))
+            if "Agree" in aln:    s.at[i,"Alignment"]="color:#16a34a;font-weight:600"
+            elif "Conflict" in aln: s.at[i,"Alignment"]="color:#f59e0b;font-weight:600"
         return s
 
     st.dataframe(df_clean.style.apply(style_tbl,axis=None),
                  use_container_width=True, hide_index=True)
+
+    # Alignment explanation
+    conflicts = [r for r in tbl if r.get("Alignment","") == "⚠️ Conflict"]
+    if conflicts:
+        with st.expander(f"⚠️ {len(conflicts)} signal conflict(s) — Daily vs Optimizer disagree"):
+            st.markdown("""
+**Why they can differ:**
+- **Daily Strategy** uses today's live RSI, MACD, BB, volume, gap and session signals — it answers *"what should I do right now?"*
+- **Capital Optimizer** uses 6-month historical Sharpe, win rate, choppiness and trend score — it answers *"how should capital be distributed over time?"*
+
+They will naturally disagree when:
+- A position had a good 6-month history (Optimizer: hold/add) but today shows bearish signals (Daily: reduce)
+- A position is early in its cycle today (Daily: add) but has poor historical Sharpe (Optimizer: reduce)
+
+**How to resolve a conflict:**
+- If Daily says EXIT/REDUCE and Optimizer says ADD → trust the Daily for today, review the Optimizer once the signal clears
+- If Daily says ADD and Optimizer says REDUCE → the historical metrics are weak; only add if you have high conviction in today's setup
+- If both agree → highest confidence signal
+            """)
+            for r in conflicts:
+                dc = "#f59e0b"
+                st.markdown(
+                    f"<div style='border-left:3px solid {dc};padding:8px 12px;"
+                    f"background:rgba(245,158,11,0.04);border-radius:0 6px 6px 0;"
+                    f"margin-bottom:4px;font-size:0.82rem'>"
+                    f"<b>{r['Name']}</b> ({r['Ticker']}) · "
+                    f"Daily: <b>{r.get('Daily signal','—')}</b> · "
+                    f"Optimizer action: <b>{r['Action']}</b> · "
+                    f"Consensus: {r['Consensus %']}</div>",
+                    unsafe_allow_html=True)
 
     # Method explanation expander
     with st.expander("📖 What each method measures"):
@@ -1260,20 +1429,44 @@ Instruments where you have a statistical edge get more capital.
 def _max_sharpe_weights(study_rows, max_single, min_pos):
     """
     Max Sharpe-like: weight proportional to Sharpe score.
-    Negative Sharpe = zero weight.
-    Also applies sector money flow multiplier.
+    Penalises low-choppiness (non-oscillating) and low-range stocks —
+    these are bad fits for a range trader even if historically steady.
     """
     weights = {}
     for s in study_rows:
         sh = max(s.get("sharpe", 0), 0)
-        # Money flow multiplier
+
+        # ── Choppiness multiplier (CRITICAL for range trading) ────────
+        # Low choppiness = trending/grinding = NOT suitable for range
+        chop = s.get("chop_now", 50) or s.get("chop", 50) or 50
+        if chop >= 61.8:   cm = 1.40   # oscillating — ideal
+        elif chop >= 55:   cm = 1.10
+        elif chop >= 45:   cm = 0.80
+        elif chop >= 38:   cm = 0.40   # trending — poor fit
+        else:              cm = 0.10   # strong trend — avoid
+
+        # ── Daily range multiplier ────────────────────────────────────
+        # Low range = not enough daily swing to profit from
+        avg_r_pct = s.get("avg_range_pct", 0) or 0
+        if avg_r_pct >= 4.0:   rm = 1.40   # big daily swings
+        elif avg_r_pct >= 2.5: rm = 1.20
+        elif avg_r_pct >= 1.5: rm = 1.00
+        elif avg_r_pct >= 0.8: rm = 0.60   # too small to profit from
+        else:                  rm = 0.20   # grinding stock — avoid
+
+        # ── Trend trap penalty ────────────────────────────────────────
+        ts = s.get("trend_score", 0)
+        tm = max(0.1, (100 - ts) / 100)
+
+        # ── Money flow multiplier ─────────────────────────────────────
         flow = s.get("flow_score", 0)
         if flow >= 50:    flow_mult = 1.30
         elif flow >= 20:  flow_mult = 1.15
         elif flow >= -20: flow_mult = 1.00
         elif flow >= -50: flow_mult = 0.75
         else:             flow_mult = 0.50
-        # Rotation multiplier: buy_rot>62 = early cycle = boost, sell_rot>62 = peak = reduce
+
+        # ── Rotation multiplier ───────────────────────────────────────
         buy_r  = s.get("buy_rot", 50)
         sell_r = s.get("sell_rot", 50)
         if buy_r >= 70:    rot_mult = 1.20
@@ -1281,7 +1474,10 @@ def _max_sharpe_weights(study_rows, max_single, min_pos):
         elif sell_r >= 70: rot_mult = 0.60
         elif sell_r >= 62: rot_mult = 0.80
         else:              rot_mult = 1.00
-        weights[s["ticker"]] = sh * flow_mult * rot_mult
+
+        ee = max(s.get("earn_eff",0), 0)
+        weights[s["ticker"]] = (ee*0.70 + max(sh,0)*0.30) * flow_mult * rot_mult
+
     total = sum(weights.values())
     if total == 0:
         return {s["ticker"]: 0 for s in study_rows}
@@ -1311,19 +1507,25 @@ def _kelly_weights(study_rows, max_single, min_pos):
         kelly  = edge / odds                  # fraction of capital to bet
         kelly  = max(kelly, 0)
 
-        # Choppiness multiplier
+        # Choppiness multiplier — stronger penalty for non-oscillating stocks
         chop = s.get("chop_now", 50) or s.get("chop", 50) or 50
-        if chop >= 61.8:   cm = 1.3
-        elif chop >= 50:   cm = 1.0
-        elif chop >= 38:   cm = 0.6
-        else:              cm = 0.2
+        if chop >= 61.8:   cm = 1.40   # oscillating — ideal for range trading
+        elif chop >= 55:   cm = 1.10
+        elif chop >= 45:   cm = 0.70
+        elif chop >= 38:   cm = 0.25   # trending — poor fit
+        else:              cm = 0.05   # strong trend — near-zero weight
 
         # Trend trap penalty
         ts   = s.get("trend_score", 0)
         tm   = max(0.1, (100 - ts) / 100)
 
-        # Range bonus
-        rm   = min(1 + avg_r/80, 1.4)
+        # Range multiplier — low range = not worth trading for range profit
+        avg_r_pct = s.get("avg_range_pct", 0) or 0
+        if avg_r_pct >= 4.0:   rm = 1.40
+        elif avg_r_pct >= 2.5: rm = 1.20
+        elif avg_r_pct >= 1.5: rm = 1.00
+        elif avg_r_pct >= 0.8: rm = 0.50
+        else:                  rm = 0.15
 
         # Money flow multiplier
         flow = s.get("flow_score", 0)
@@ -1341,7 +1543,8 @@ def _kelly_weights(study_rows, max_single, min_pos):
         elif sell_r >= 62: rot_m = 0.80
         else:              rot_m = 1.00
 
-        weights[s["ticker"]] = kelly * cm * tm * rm * fm * rot_m
+        ee = max(s.get("earn_eff",0), 0)
+        weights[s["ticker"]] = (ee*0.60 + kelly*0.40) * cm * tm * fm * rot_m
 
     total = sum(weights.values())
     if total == 0:
@@ -1364,9 +1567,9 @@ def _range_opportunity_weights(study_rows, max_single, min_pos):
             weights[s["ticker"]] = 0; continue
 
         ts  = s.get("trend_score", 0)
-        tm  = max(0.1, (100 - ts) / 100)             # trend trap penalty
+        tm  = max(0.1, (100 - ts) / 100)
         chop = s.get("chop_now",50) or s.get("chop",50) or 50
-        cm  = 1.3 if chop>=61.8 else 1.0 if chop>=50 else 0.6 if chop>=38 else 0.2
+        cm  = 1.40 if chop>=61.8 else 1.10 if chop>=55 else 0.70 if chop>=45 else 0.20 if chop>=38 else 0.05
 
         flow = s.get("flow_score", 0)
         fm   = 1.30 if flow>=50 else 1.15 if flow>=20 else 1.0 if flow>=-20 else 0.75 if flow>=-50 else 0.50
@@ -1374,7 +1577,8 @@ def _range_opportunity_weights(study_rows, max_single, min_pos):
         buy_r = s.get("buy_rot", 50); sell_r = s.get("sell_rot", 50)
         rot_m = 1.20 if buy_r>=70 else 1.10 if buy_r>=62 else 0.60 if sell_r>=70 else 0.80 if sell_r>=62 else 1.00
 
-        weights[s["ticker"]] = avg_r_pct * tm * cm * fm * rot_m
+        ee = max(s.get("earn_eff",0), 0)
+        weights[s["ticker"]] = ee * tm * fm * rot_m
 
     total = sum(weights.values())
     if total == 0:
@@ -1407,7 +1611,8 @@ def _momentum_efficiency_weights(study_rows, max_single, min_pos):
         flow = s.get("flow_score", 0)
         fm   = 1.30 if flow>=50 else 1.15 if flow>=20 else 1.0 if flow>=-20 else 0.75 if flow>=-50 else 0.50
 
-        weights[s["ticker"]] = max(efficiency, 0) * tm * fm
+        ee = max(s.get("earn_eff",0), 0)
+        weights[s["ticker"]] = ee * max(efficiency,0) * tm * fm
 
     total = sum(weights.values())
     if total == 0:
@@ -1437,12 +1642,13 @@ def _cycle_adjusted_weights(study_rows, max_single, min_pos):
         else:               base = 0.6   # mid cycle — moderate
 
         # Require choppiness — if not oscillating, no point
-        cm = 1.2 if chop>=61.8 else 1.0 if chop>=50 else 0.5 if chop>=38 else 0.1
+        cm = 1.40 if chop>=61.8 else 1.10 if chop>=55 else 0.70 if chop>=45 else 0.20 if chop>=38 else 0.05
         tm = max(0.1, (100 - ts) / 100)
         flow = s.get("flow_score", 0)
         fm   = 1.30 if flow>=50 else 1.15 if flow>=20 else 1.0 if flow>=-20 else 0.75 if flow>=-50 else 0.50
 
-        weights[s["ticker"]] = base * cm * tm * fm
+        ee = max(s.get("earn_eff",0), 0)
+        weights[s["ticker"]] = ee * base * cm * tm * fm
 
     total = sum(weights.values())
     if total == 0:
@@ -1739,11 +1945,12 @@ elif page == "🔬  Analysis":
 elif page == "🛡  Risk":
     risk_tools.render()
 
-elif page == "🔍  Scanner":
-    volume_scanner.render()
-
-elif page == "📐  Study":
-    portfolio_study.render()
+elif page == "🔎  Opportunities":
+    opp_tab1, opp_tab2 = st.tabs(["🔬 Portfolio Study", "📊 Volume Scanner"])
+    with opp_tab1:
+        portfolio_study.render()
+    with opp_tab2:
+        volume_scanner.render()
 
 elif page == "📅  Daily":
     daily_strategy.render()

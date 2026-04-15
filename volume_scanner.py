@@ -174,12 +174,34 @@ def scan_ticker_full(ticker: str, lookback: int) -> dict | None:
         # ── Day change ────────────────────────────────────────────────
         day_pct = (price - prev_close) / prev_close * 100 if prev_close else None
 
+        # ── Meso cycle position ───────────────────────────────────────
+        try:
+            c_    = df["Close"]
+            d_    = c_.diff()
+            g_    = d_.clip(lower=0).ewm(com=13, adjust=False).mean()
+            l_    = (-d_.clip(upper=0)).ewm(com=13, adjust=False).mean()
+            rsi_c = float((100 - 100 / (1 + g_ / l_.replace(0, np.nan))).dropna().iloc[-1])
+            mid_c = float(c_.rolling(20).mean().iloc[-1])
+            std_c = float(c_.rolling(20).std().iloc[-1])
+            bb_c  = float(((c_.iloc[-1] - mid_c + 2*std_c) / (4*std_c + 1e-9)) * 100)
+            bb_c  = max(0, min(100, bb_c))
+            vr5   = float(df["Volume"].tail(5).mean()) / float(df["Volume"].rolling(20).mean().iloc[-1] + 1e-9)
+            vol_w = min(vr5 / 2, 1.0) * 100
+            meso_pct = round(max(0, min(100, rsi_c*0.40 + bb_c*0.40 + vol_w*0.20)), 1)
+            if meso_pct < 35:   cycle_label = "✅ Early"
+            elif meso_pct < 55: cycle_label = "🟢 Mid"
+            elif meso_pct < 70: cycle_label = "🟡 Late"
+            else:               cycle_label = "🔴 Peak"
+        except Exception:
+            meso_pct = 50; cycle_label = "—"
+
         # ── Score ─────────────────────────────────────────────────────
-        swing_s = min(avg_range / 80.0, 1.0) * 100
-        chop_s  = max(0, min((ci - 30) / 40 * 100, 100)) if ci else 50
-        vol_s   = min(vol_ratio / 3.0, 1.0) * 100
-        cons_s  = pct_above_20
-        score   = swing_s*0.35 + chop_s*0.25 + vol_s*0.25 + cons_s*0.15
+        swing_s  = min(avg_range / 80.0, 1.0) * 100
+        chop_s   = max(0, min((ci - 30) / 40 * 100, 100)) if ci else 50
+        vol_s    = min(vol_ratio / 3.0, 1.0) * 100
+        cons_s   = pct_above_20
+        cycle_bonus = 10 if meso_pct < 35 else 5 if meso_pct < 50 else -10 if meso_pct > 70 else 0
+        score    = swing_s*0.33 + chop_s*0.24 + vol_s*0.24 + cons_s*0.14 + cycle_bonus
 
         return {
             "ticker":       ticker,
@@ -198,6 +220,8 @@ def scan_ticker_full(ticker: str, lookback: int) -> dict | None:
             "mkt_cap":      mkt_cap,
             "choppiness":   ci,
             "dir_changes":  dir_chg,
+            "meso_pct":     meso_pct,
+            "cycle_label":  cycle_label,
             "score":        round(score, 1),
         }
     except Exception as e:
@@ -381,8 +405,15 @@ computes all swing metrics. Slower but gives the full picture.
     top_n      = r2c4.slider(
         "Show top N results", 5, 50, 20, key="sc_topn")
 
-    sort_col = st.selectbox(
-        "Sort by", ["Score", "Avg Range (HKD)", "Today Range",
+    r3c1, r3c2 = st.columns(2)
+    cycle_filter = r3c1.select_slider(
+        "Cycle position filter",
+        options=["Any", "Early only (<35%)", "Early + Mid (<55%)", "Exclude peak (>70%)"],
+        value="Early + Mid (<55%)",
+        key="sc_cycle",
+        help="Filter by meso cycle position (daily RSI+BB+volume). Early = best entry zone.")
+    sort_col = r3c2.selectbox(
+        "Sort by", ["Score", "Cycle Position", "Avg Range (HKD)", "Today Range",
                     "Vol Ratio", "Choppiness", "Turnover (HKD)"],
         key="sc_sort")
 
@@ -505,16 +536,28 @@ computes all swing metrics. Slower but gives the full picture.
     df = df[df["choppiness"].fillna(0) >= min_chop]
     df = df[df["vol_ratio"]  >= min_vol_r]
 
+    # Cycle filter
+    cycle_filter = st.session_state.get("sc_cycle", "Early + Mid (<55%)")
+    if "meso_pct" in df.columns:
+        if cycle_filter == "Early only (<35%)":
+            df = df[df["meso_pct"] < 35]
+        elif cycle_filter == "Early + Mid (<55%)":
+            df = df[df["meso_pct"] < 55]
+        elif cycle_filter == "Exclude peak (>70%)":
+            df = df[df["meso_pct"] < 70]
+
     sort_map = {
         "Score":           "score",
+        "Cycle Position":  "meso_pct",
         "Avg Range (HKD)": "avg_range",
         "Today Range":     "today_range",
         "Vol Ratio":       "vol_ratio",
         "Choppiness":      "choppiness",
         "Turnover (HKD)":  "turnover_hkd",
     }
+    _asc = sort_col == "Cycle Position"
     df = df.sort_values(sort_map.get(sort_col, "score"),
-                        ascending=False).head(top_n).reset_index(drop=True)
+                        ascending=_asc).head(top_n).reset_index(drop=True)
 
     if df.empty:
         st.warning(
@@ -603,13 +646,15 @@ computes all swing metrics. Slower but gives the full picture.
 
     # ── Results table ─────────────────────────────────────────────────
     st.markdown("### Results Table")
-    hdr = st.columns([2.5, 0.8, 0.9, 1, 1, 1, 1, 1, 0.8])
+    _ar_lbl = "Avg Range\n({:d}d)".format(lookback)
+    hdr = st.columns([2.2, 0.8, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.85, 0.8])
     for col_w, lbl in zip(hdr, ["Stock","Price","Day Chg",
-                                  f"Avg Range\n({lookback}d)",
-                                  "Today\nRange",
-                                  "% Days\n≥20 HKD",
-                                  "Vol\nRatio",
+                                  _ar_lbl,
+                                  "Today\\nRange",
+                                  "% Days\\n\u226520 HKD",
+                                  "Vol\\nRatio",
                                   "Choppiness",
+                                  "Cycle\\nPosition",
                                   "Score"]):
         col_w.markdown(
             f"<span style='font-size:0.7rem;color:#94a3b8;"
@@ -619,7 +664,7 @@ computes all swing metrics. Slower but gives the full picture.
                 unsafe_allow_html=True)
 
     for rank, (_, row) in enumerate(df.iterrows(), 1):
-        rc = st.columns([2.5, 0.8, 0.9, 1, 1, 1, 1, 1, 0.8])
+        rc = st.columns([2.2, 0.8, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.85, 0.8])
 
         rc[0].markdown(
             f"<div style='font-weight:600;font-size:0.86rem'>#{rank} {row['name'][:22]}</div>"
@@ -669,7 +714,15 @@ computes all swing metrics. Slower but gives the full picture.
             f"{'—' if not ci else '{:.0f} {}'.format(ci, ci_l)}</span>",
             unsafe_allow_html=True)
 
+        cyc_p = row.get("meso_pct", 50)
+        cyc_l = row.get("cycle_label", "—")
+        cyc_c = "#16a34a" if cyc_p < 35 else "#16a34a" if cyc_p < 55 else "#f59e0b" if cyc_p < 70 else "#dc2626"
         rc[8].markdown(
+            f"<span style='color:{cyc_c};font-size:0.8rem;font-weight:600'>{cyc_l}</span>"
+            f"<br><span style='color:{cyc_c};font-size:0.7rem'>{cyc_p:.0f}%</span>",
+            unsafe_allow_html=True)
+
+        rc[9].markdown(
             f"<span style='color:{score_color(row['score'])};"
             f"font-size:1rem;font-weight:800'>{row['score']:.0f}</span>",
             unsafe_allow_html=True)
