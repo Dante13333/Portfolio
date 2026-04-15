@@ -494,26 +494,64 @@ computes all swing metrics. Slower but gives the full picture.
             "turnover", ascending=False).head(max_candidates).reset_index(drop=True)
 
         st.success(
-            f"Stage 1 complete — found **{len(df_liquid)} liquid stocks** "
-            f"(from {len(all_codes)} candidates, min turnover HKD {min_turnover:,.0f})")
+            f"✅ Stage 1 complete — **{len(df_liquid)} liquid stocks** found "
+            f"(from {len(all_codes)} codes scanned, min turnover HKD {min_turnover:,.0f})")
+
+        # Show Stage 1 results table immediately
+        with st.expander(f"📋 Stage 1 results — {len(df_liquid)} liquid stocks (sorted by turnover)", expanded=True):
+            s1_data = []
+            for _, sr in df_liquid.iterrows():
+                s1_data.append({
+                    "Ticker":        sr["ticker"],
+                    "Price (HKD)":   f"{sr['price']:,.2f}" if sr["price"]<100 else f"{sr['price']:,.1f}",
+                    "Volume":        f"{int(sr['volume']):,}",
+                    "Turnover (HKD)":f"{sr['turnover']/1e6:.1f}M",
+                })
+            st.dataframe(pd.DataFrame(s1_data), use_container_width=True, hide_index=True)
+            st.caption("These stocks passed the liquidity filter and will now be deep-scanned in Stage 2.")
 
         # ── Stage 2: Deep scan ───────────────────────────────────────
         st.markdown("### Stage 2 — Deep scanning for swing quality…")
         prog2 = st.progress(0, text="Starting deep scan…")
 
         results = []
+        s2_placeholder = st.empty()
+
         for i, row in df_liquid.iterrows():
             t = row["ticker"]
             prog2.progress(
                 (i+1)/len(df_liquid),
-                text=f"Deep scanning {t}… ({i+1}/{len(df_liquid)}, "
-                     f"{len(results)} passing so far)")
+                text=f"Scanning {t}… ({i+1}/{len(df_liquid)}, "
+                     f"{len(results)} passing filters so far)")
             r = scan_ticker_full(t, lookback)
             if r:
                 results.append(r)
-            time.sleep(0.5)   # pace requests to avoid rate limit
+                # Live preview table — update after every new result
+                _preview = sorted(results, key=lambda x: -x["score"])[:15]
+                _rows = []
+                for _r in _preview:
+                    _cp = _r.get("meso_pct",50)
+                    _cl = _r.get("cycle_label","—")
+                    _rows.append({
+                        "Name":      _r["name"][:20],
+                        "Ticker":    _r["ticker"],
+                        "Score":     f"{_r['score']:.0f}",
+                        "Avg Range": f"HKD {_r['avg_range']:.1f}",
+                        "Chop":      f"{_r['choppiness']:.0f}" if _r.get("choppiness") else "—",
+                        "Vol ×":     f"{_r['vol_ratio']:.1f}×",
+                        "Cycle":     f"{_cl} {_cp:.0f}%",
+                    })
+                with s2_placeholder.container():
+                    st.markdown(
+                        f"<span style='font-size:0.8rem;color:#64748b'>"
+                        f"🔬 Stage 2 live — top {len(_rows)} so far (updating…)</span>",
+                        unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame(_rows),
+                                 use_container_width=True, hide_index=True)
+            time.sleep(0.5)
 
         prog2.empty()
+        s2_placeholder.empty()
         st.session_state["sc_results"] = results
         st.session_state["sc_params"]  = {
             "min_range": min_range, "min_chop": min_chop,
